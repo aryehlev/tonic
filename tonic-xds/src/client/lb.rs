@@ -24,7 +24,8 @@ pub(crate) trait ClusterDiscovery<Endpoint, S>: Send + Sync + 'static {
 
 /// Errors that can occur during load balancing.
 #[derive(Debug, Clone, thiserror::Error)]
-pub(crate) enum LoadBalancingError {
+pub enum LoadBalancingError {
+    /// The routing layer did not attach a [`RouteDecision`] extension to the request.
     #[error("No routing decision extension from the routing layer available")]
     NoRoutingDecision,
 }

@@ -82,13 +82,17 @@ impl Router for XdsRouter {
 
 /// Error returned when routing fails.
 #[derive(Debug, Clone, thiserror::Error)]
-pub(crate) enum RoutingError {
+pub enum RoutingError {
+    /// No route configuration has been received from the xDS management server yet.
     #[error("route config not yet available")]
     NotReady,
+    /// No virtual host matched the request's authority (`:authority` / `Host` header).
     #[error("no matching virtual host for authority '{0}'")]
     NoMatchingVirtualHost(String),
+    /// A matching virtual host was found but none of its routes matched the request path.
     #[error("no matching route in virtual host for path '{0}'")]
     NoMatchingRoute(String),
+    /// A weighted-cluster route was matched but the cluster list was empty.
     #[error("weighted cluster selection failed (empty cluster list)")]
     EmptyWeightedClusters,
 }
