@@ -1,14 +1,18 @@
 use crate::XdsUri;
 use crate::client::endpoint::{EndpointAddress, EndpointChannel};
+use crate::client::error::XdsError;
 use crate::client::lb::XdsLbService;
 use crate::client::route::XdsRoutingService;
 use crate::common::async_util::BoxFuture;
 use http::Request;
+use std::fmt;
 use std::fmt::Debug;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use tonic::{body::Body as TonicBody, client::GrpcService, transport::channel::Channel};
-use tower::{BoxError, Service, load::Load, util::BoxCloneService};
+use tower::{BoxError, Service, load::Load};
 
 #[cfg(test)]
 use {
@@ -110,21 +114,104 @@ where
     }
 }
 
-/// A type alias for an `XdsChannel` that uses Tonic's Channel as the underlying transport.
+/// Concrete type alias for the tonic-gRPC flavour of [`XdsChannel`].
 pub(crate) type XdsChannelTonicGrpc =
     XdsChannel<http::Request<TonicBody>, EndpointAddress, EndpointChannel<Channel>>;
 
-/// A [`tonic::client::GrpcService`] implementation that can route and load-balance
-/// gRPC requests based on xDS configuration.
-pub type XdsChannelGrpc =
-    BoxCloneService<http::Request<TonicBody>, http::Response<TonicBody>, BoxError>;
-
-// Static assertion that XdsChannelGrpc and XdsChannelTonicGrpc implement GrpcService
+// Static assertion that XdsChannelTonicGrpc implements GrpcService.
 const _: fn() = || {
     fn assert_grpc_service<T: GrpcService<TonicBody>>() {}
-    assert_grpc_service::<XdsChannelGrpc>();
     assert_grpc_service::<XdsChannelTonicGrpc>();
+    assert_grpc_service::<XdsChannelGrpc>();
 };
+
+// ---------------------------------------------------------------------------
+// XdsChannelGrpc — the public channel type, mirroring tonic::transport::Channel
+// ---------------------------------------------------------------------------
+
+/// A [`tonic::client::GrpcService`] that routes and load-balances gRPC requests
+/// using xDS configuration.
+///
+/// `XdsChannelGrpc` is cheap to clone: all shared state (cluster registry, router,
+/// endpoint discovery) lives behind [`Arc`]s internally, so each clone is just a
+/// handful of reference-count bumps — no background task or buffer is duplicated.
+///
+/// # Usage
+///
+/// Build one via [`XdsChannelBuilder`] and pass it directly to any generated tonic
+/// client stub:
+///
+/// ```rust,no_run
+/// use tonic_xds::{XdsChannelBuilder, XdsChannelConfig, XdsUri};
+///
+/// let channel = XdsChannelBuilder::with_config(
+///     XdsChannelConfig::default().with_target_uri(
+///         XdsUri::parse("xds:///my-service:443").unwrap(),
+///     ),
+/// )
+/// .build_grpc_channel();
+///
+/// // let client = MyServiceClient::new(channel);
+/// ```
+#[derive(Clone)]
+pub struct XdsChannelGrpc {
+    inner: XdsChannelTonicGrpc,
+}
+
+/// The future returned by [`XdsChannelGrpc`]'s [`Service::call`].
+///
+/// Resolves to a typed [`XdsError`] rather than the erased [`BoxError`] you
+/// would get from the raw inner service, making it easier to match on the
+/// specific failure reason (routing vs. load-balancing vs. transport).
+pub struct ResponseFuture {
+    inner: BoxFuture<Result<http::Response<TonicBody>, XdsError>>,
+}
+
+impl fmt::Debug for XdsChannelGrpc {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("XdsChannelGrpc").finish()
+    }
+}
+
+impl fmt::Debug for ResponseFuture {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ResponseFuture").finish()
+    }
+}
+
+impl Service<http::Request<TonicBody>> for XdsChannelGrpc {
+    type Response = http::Response<TonicBody>;
+    type Error = XdsError;
+    type Future = ResponseFuture;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        tower::Service::poll_ready(&mut self.inner, cx).map_err(XdsError::from_box_error)
+    }
+
+    fn call(&mut self, request: http::Request<TonicBody>) -> Self::Future {
+        let fut = tower::Service::call(&mut self.inner, request);
+        ResponseFuture {
+            inner: Box::pin(async move {
+                let result: Result<http::Response<TonicBody>, BoxError> = fut.await;
+                result.map_err(XdsError::from_box_error)
+            }),
+        }
+    }
+}
+
+// ResponseFuture is Unpin because its only field is Pin<Box<dyn Future>>,
+// and Pin<Box<T>>: Unpin for all T (moving the box doesn't move the allocation).
+impl Future for ResponseFuture {
+    type Output = Result<http::Response<TonicBody>, XdsError>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.get_mut().inner.as_mut().poll(cx)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Builder
+// ---------------------------------------------------------------------------
 
 /// Builder for creating an [`XdsChannel`] or [`XdsChannelGrpc`].
 #[derive(Clone, Debug)]
@@ -158,10 +245,12 @@ impl XdsChannelBuilder {
         todo!("Implement XdsChannel building logic");
     }
 
-    /// Builds an `XdsChannelGrpc`, which is a type-erased gRPC channel.
+    /// Builds an [`XdsChannelGrpc`].
     #[must_use]
     pub fn build_grpc_channel(&self) -> XdsChannelGrpc {
-        BoxCloneService::new(self.build_tonic_grpc_channel())
+        XdsChannelGrpc {
+            inner: self.build_tonic_grpc_channel(),
+        }
     }
 
     /// Builds an `XdsChannelGrpc` from the given router and cluster discovery.
@@ -177,10 +266,12 @@ impl XdsChannelBuilder {
         let service = ServiceBuilder::new()
             .layer(routing_layer)
             .service(lb_service);
-        BoxCloneService::new(XdsChannelTonicGrpc {
-            config: self.config.clone(),
-            inner: service,
-        })
+        XdsChannelGrpc {
+            inner: XdsChannelTonicGrpc {
+                config: self.config.clone(),
+                inner: service,
+            },
+        }
     }
 }
 

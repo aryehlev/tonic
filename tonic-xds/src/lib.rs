@@ -46,7 +46,12 @@ pub(crate) mod client;
 pub(crate) mod common;
 pub(crate) mod xds;
 
-pub use client::channel::{XdsChannel, XdsChannelBuilder, XdsChannelConfig, XdsChannelGrpc};
+pub use client::channel::{
+    ResponseFuture, XdsChannel, XdsChannelBuilder, XdsChannelConfig, XdsChannelGrpc,
+};
+pub use client::error::XdsError;
+pub use client::lb::LoadBalancingError;
+pub use xds::routing::RoutingError;
 pub use xds::uri::{XdsUri, XdsUriError};
 
 #[cfg(test)]
