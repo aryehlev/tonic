@@ -346,10 +346,60 @@ mod tests {
         addr
     }
 
+    #[cfg(unix)]
+    async fn start_mock_uds_server() -> std::path::PathBuf {
+        use tokio::net::UnixListener;
+        use tokio_stream::wrappers::UnixListenerStream;
+
+        let path = std::env::temp_dir()
+            .join(format!("xds_test_{}.sock", std::process::id()));
+
+        let listener = UnixListener::bind(&path).unwrap();
+
+        tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(AggregatedDiscoveryServiceServer::new(MockAdsServer))
+                .serve_with_incoming(UnixListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        path
+    }
+
     #[tokio::test]
     async fn test_tonic_transport_connect_and_stream() {
         let addr = start_mock_server().await;
         let uri = format!("http://{addr}");
+
+        let transport = TonicTransport::connect(&uri).await.unwrap();
+
+        let request = DiscoveryRequest {
+            type_url: "type.googleapis.com/envoy.config.listener.v3.Listener".to_string(),
+            resource_names: vec!["listener-1".to_string()],
+            ..Default::default()
+        };
+        let request_bytes: Bytes = request.encode_to_vec().into();
+
+        let mut stream = transport.new_stream(vec![request_bytes]).await.unwrap();
+
+        let response_bytes = stream.recv().await.unwrap().unwrap();
+        let response = DiscoveryResponse::decode(response_bytes).unwrap();
+
+        assert_eq!(response.version_info, "1");
+        assert_eq!(
+            response.type_url,
+            "type.googleapis.com/envoy.config.listener.v3.Listener"
+        );
+        assert_eq!(response.nonce, "nonce-1");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_tonic_transport_unix_socket() {
+        let path = start_mock_uds_server().await;
+        let uri = format!("unix://{}", path.display());
 
         let transport = TonicTransport::connect(&uri).await.unwrap();
 
