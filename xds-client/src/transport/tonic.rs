@@ -16,6 +16,24 @@ use tonic::codec::{Codec, DecodeBuf, Decoder, EncodeBuf, Encoder};
 use tonic::transport::{Channel, Endpoint};
 use tonic::{Status, Streaming};
 
+/// Normalise a gRFC A27 `server_uri` into a URI that tonic's `Endpoint` can
+/// parse correctly.
+///
+/// Bootstrap configs often contain bare `host:port` strings (e.g.
+/// `istiod.istio-system.svc:15012`).  `http::Uri` mis-parses these as
+/// `scheme = "istiod.istio-system.svc"` with no authority, causing
+/// `AddOrigin` to inject an empty `:authority` header.  Prepending
+/// `http://` turns them into well-formed URIs with a proper authority.
+///
+/// `unix:`, `http://`, and `https://` URIs are left unchanged.
+fn normalize_server_uri(s: &str) -> String {
+    if s.starts_with("http://") || s.starts_with("https://") || s.starts_with("unix:") {
+        s.to_string()
+    } else {
+        format!("http://{s}")
+    }
+}
+
 /// The gRPC path for the ADS StreamAggregatedResources RPC.
 const ADS_PATH: &str =
     "/envoy.service.discovery.v3.AggregatedDiscoveryService/StreamAggregatedResources";
@@ -174,7 +192,7 @@ impl TransportBuilder for TonicTransportBuilder {
     type Transport = TonicTransport;
 
     async fn build(&self, server: &ServerConfig) -> Result<Self::Transport> {
-        let endpoint = Endpoint::from_shared(server.uri().to_string())
+        let endpoint = Endpoint::from_shared(normalize_server_uri(server.uri()))
             .map_err(|e| Error::Connection(e.to_string()))?;
 
         #[cfg(any(feature = "tonic-tls-ring", feature = "tonic-tls-aws-lc"))]
