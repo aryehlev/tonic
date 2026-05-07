@@ -351,8 +351,7 @@ mod tests {
         use tokio::net::UnixListener;
         use tokio_stream::wrappers::UnixListenerStream;
 
-        let path = std::env::temp_dir()
-            .join(format!("xds_test_{}.sock", std::process::id()));
+        let path = std::env::temp_dir().join(format!("xds_test_{}.sock", std::process::id()));
 
         let listener = UnixListener::bind(&path).unwrap();
 
