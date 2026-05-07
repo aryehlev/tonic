@@ -270,7 +270,10 @@ impl From<NodeConfig> for Node {
                 .metadata
                 .into_iter()
                 .map(|(k, v)| {
-                    let s = v.as_str().map(str::to_owned).unwrap_or_else(|| v.to_string());
+                    let s = v
+                        .as_str()
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| v.to_string());
                     (k, s)
                 })
                 .collect();
@@ -502,9 +505,18 @@ mod tests {
         }"#;
         let config = BootstrapConfig::from_json(json).unwrap();
         let node = Node::from(config.node);
-        assert_eq!(node.metadata.get("NAMESPACE").map(|s| s.as_str()), Some("default"));
-        assert_eq!(node.metadata.get("POD_NAME").map(|s| s.as_str()), Some("my-pod"));
-        assert_eq!(node.metadata.get("INSTANCE_IPS").map(|s| s.as_str()), Some("10.0.0.1"));
+        assert_eq!(
+            node.metadata.get("NAMESPACE").map(|s| s.as_str()),
+            Some("default")
+        );
+        assert_eq!(
+            node.metadata.get("POD_NAME").map(|s| s.as_str()),
+            Some("my-pod")
+        );
+        assert_eq!(
+            node.metadata.get("INSTANCE_IPS").map(|s| s.as_str()),
+            Some("10.0.0.1")
+        );
     }
 
     #[test]
@@ -521,7 +533,10 @@ mod tests {
         let config = BootstrapConfig::from_json(json).unwrap();
         let node = Node::from(config.node);
         assert_eq!(node.metadata.get("COUNT").map(|s| s.as_str()), Some("42"));
-        assert_eq!(node.metadata.get("ENABLED").map(|s| s.as_str()), Some("true"));
+        assert_eq!(
+            node.metadata.get("ENABLED").map(|s| s.as_str()),
+            Some("true")
+        );
     }
 
     #[test]
