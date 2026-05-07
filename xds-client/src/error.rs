@@ -3,7 +3,7 @@
 use thiserror::Error;
 
 /// Error type for the xDS client.
-#[derive(Debug, Error)]
+#[derive(Debug, Clone, Error)]
 pub enum Error {
     /// Failed to connect to the xDS server.
     #[error("failed to connect: {0}")]

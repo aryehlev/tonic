@@ -408,7 +408,8 @@ where
 
             let transport = match self.transport_builder.build(server).await {
                 Ok(t) => t,
-                Err(_) => {
+                Err(e) => {
+                    self.broadcast_ambient_error(e).await;
                     match self.backoff.next_backoff() {
                         Some(backoff) => self.runtime.sleep(backoff).await,
                         None => return, // Max attempts exceeded
@@ -422,7 +423,8 @@ where
                     self.backoff.reset();
                     s
                 }
-                Err(_) => {
+                Err(e) => {
+                    self.broadcast_ambient_error(e).await;
                     match self.backoff.next_backoff() {
                         Some(backoff) => self.runtime.sleep(backoff).await,
                         None => return, // Max attempts exceeded
@@ -433,7 +435,8 @@ where
 
             match self.run_connected(stream).await {
                 Ok(()) => return, // shutdown
-                Err(_e) => {
+                Err(e) => {
+                    self.broadcast_ambient_error(e).await;
                     match self.backoff.next_backoff() {
                         Some(backoff) => self.runtime.sleep(backoff).await,
                         None => return, // Max attempts exceeded
@@ -955,6 +958,25 @@ where
 
         let bytes = self.codec.encode_request(&request)?;
         stream.send(bytes).await
+    }
+
+    /// Broadcast an ambient error to all active watchers across every type.
+    ///
+    /// Used when a connection-level error (transport build, stream init, stream
+    /// disconnect) occurs so watchers can observe it, even though the worker
+    /// will retry. Receivers that match AmbientError per gRFC A88 may keep
+    /// serving from their local cache.
+    async fn broadcast_ambient_error(&self, error: Error) {
+        for type_state in self.type_states.values() {
+            for entry in type_state.watchers.values() {
+                let (done, _rx) = ProcessingDone::channel();
+                let event = ResourceEvent::AmbientError {
+                    error: error.clone(),
+                    done,
+                };
+                let _ = entry.event_tx.send(event).await;
+            }
+        }
     }
 
     /// Start a timer for a resource in Requested state (gRFC A57).

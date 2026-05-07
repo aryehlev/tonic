@@ -63,6 +63,12 @@ pub struct Node {
     pub user_agent_name: String,
     /// Version of the client.
     pub user_agent_version: String,
+    /// Opaque metadata supplied to the management server.
+    ///
+    /// Istiod uses this to identify the workload and tailor its response
+    /// (e.g., `NAMESPACE`, `POD_NAME`, `INSTANCE_IPS`). All values are
+    /// serialised as strings in the `google.protobuf.Struct` on the wire.
+    pub metadata: std::collections::HashMap<String, String>,
 }
 
 impl Node {
@@ -76,6 +82,7 @@ impl Node {
             locality: None,
             user_agent_name: user_agent_name.into(),
             user_agent_version: user_agent_version.into(),
+            metadata: std::collections::HashMap::new(),
         }
     }
 
@@ -94,6 +101,15 @@ impl Node {
     /// Set the locality.
     pub fn with_locality(mut self, locality: Locality) -> Self {
         self.locality = Some(locality);
+        self
+    }
+
+    /// Set the node metadata.
+    pub fn with_metadata(
+        mut self,
+        metadata: impl Into<std::collections::HashMap<String, String>>,
+    ) -> Self {
+        self.metadata = metadata.into();
         self
     }
 }

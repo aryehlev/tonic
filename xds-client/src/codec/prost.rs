@@ -16,6 +16,27 @@ impl XdsCodec for ProstCodec {
         use envoy_types::pb::envoy::service::discovery::v3 as discovery;
         use envoy_types::pb::google::rpc::Status;
 
+        use envoy_types::pb::google::protobuf::{Struct, Value, value::Kind};
+        let metadata = if request.node.metadata.is_empty() {
+            None
+        } else {
+            Some(Struct {
+                fields: request
+                    .node
+                    .metadata
+                    .iter()
+                    .map(|(k, v)| {
+                        (
+                            k.clone(),
+                            Value {
+                                kind: Some(Kind::StringValue(v.clone())),
+                            },
+                        )
+                    })
+                    .collect(),
+            })
+        };
+
         let proto_request = discovery::DiscoveryRequest {
             version_info: request.version_info.to_owned(),
             node: Some(core::Node {
@@ -30,6 +51,7 @@ impl XdsCodec for ProstCodec {
                     zone: l.zone.clone(),
                     sub_zone: l.sub_zone.clone(),
                 }),
+                metadata,
                 ..Default::default()
             }),
             resource_names: request.resource_names.to_vec(),

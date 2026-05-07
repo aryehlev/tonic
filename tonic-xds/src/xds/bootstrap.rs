@@ -121,6 +121,9 @@ pub(crate) struct NodeConfig {
     pub cluster: Option<String>,
     /// Locality where the node is running.
     pub locality: Option<LocalityConfig>,
+    /// Opaque metadata for the management server (e.g., istiod uses NAMESPACE, POD_NAME).
+    #[serde(default)]
+    pub metadata: std::collections::HashMap<String, serde_json::Value>,
 }
 
 /// Locality configuration from bootstrap JSON.
@@ -261,6 +264,17 @@ impl From<NodeConfig> for Node {
                 zone: locality.zone,
                 sub_zone: locality.sub_zone,
             });
+        }
+        if !config.metadata.is_empty() {
+            let metadata: std::collections::HashMap<String, String> = config
+                .metadata
+                .into_iter()
+                .map(|(k, v)| {
+                    let s = v.as_str().map(str::to_owned).unwrap_or_else(|| v.to_string());
+                    (k, s)
+                })
+                .collect();
+            node = node.with_metadata(metadata);
         }
 
         node
@@ -471,6 +485,50 @@ mod tests {
     fn missing_certificate_providers_defaults_to_empty() {
         let config = BootstrapConfig::from_json(minimal_json()).unwrap();
         assert!(config.certificate_providers.is_empty());
+    }
+
+    #[test]
+    fn node_metadata_string_values() {
+        let json = r#"{
+            "xds_servers": [{"server_uri": "istiod.istio-system.svc:15012"}],
+            "node": {
+                "id": "sidecar~10.0.0.1~pod.ns~ns.svc.cluster.local",
+                "metadata": {
+                    "NAMESPACE": "default",
+                    "POD_NAME": "my-pod",
+                    "INSTANCE_IPS": "10.0.0.1"
+                }
+            }
+        }"#;
+        let config = BootstrapConfig::from_json(json).unwrap();
+        let node = Node::from(config.node);
+        assert_eq!(node.metadata.get("NAMESPACE").map(|s| s.as_str()), Some("default"));
+        assert_eq!(node.metadata.get("POD_NAME").map(|s| s.as_str()), Some("my-pod"));
+        assert_eq!(node.metadata.get("INSTANCE_IPS").map(|s| s.as_str()), Some("10.0.0.1"));
+    }
+
+    #[test]
+    fn node_metadata_non_string_values_use_json_repr() {
+        let json = r#"{
+            "xds_servers": [{"server_uri": "localhost:5000"}],
+            "node": {
+                "metadata": {
+                    "COUNT": 42,
+                    "ENABLED": true
+                }
+            }
+        }"#;
+        let config = BootstrapConfig::from_json(json).unwrap();
+        let node = Node::from(config.node);
+        assert_eq!(node.metadata.get("COUNT").map(|s| s.as_str()), Some("42"));
+        assert_eq!(node.metadata.get("ENABLED").map(|s| s.as_str()), Some("true"));
+    }
+
+    #[test]
+    fn node_metadata_empty_by_default() {
+        let config = BootstrapConfig::from_json(minimal_json()).unwrap();
+        let node = Node::from(config.node);
+        assert!(node.metadata.is_empty());
     }
 
     #[test]

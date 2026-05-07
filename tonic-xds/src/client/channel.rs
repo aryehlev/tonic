@@ -224,7 +224,7 @@ impl XdsChannelBuilder {
             _xds_client: xds_client,
         });
 
-        let routing_layer = XdsRoutingLayer::new(router);
+        let routing_layer = XdsRoutingLayer::new(router, self.config.target_uri.target.as_str());
         let retry_layer = RetryLayer::new(retry_policy);
         let cluster_registry = Arc::new(ClusterClientRegistryGrpc::new());
         let lb_service = XdsLbService::new(cluster_registry, discovery);
@@ -258,7 +258,7 @@ impl XdsChannelBuilder {
         discovery: Arc<dyn ClusterDiscovery<EndpointAddress, EndpointChannel<Channel>>>,
         retry_policy: GrpcRetryPolicy,
     ) -> XdsChannelGrpc {
-        let routing_layer = XdsRoutingLayer::new(router);
+        let routing_layer = XdsRoutingLayer::new(router, self.config.target_uri.target.as_str());
         let retry_layer = RetryLayer::new(retry_policy);
         let cluster_registry = Arc::new(ClusterClientRegistryGrpc::new());
         let lb_service = XdsLbService::new(cluster_registry, discovery);
