@@ -40,12 +40,6 @@ pub(crate) struct XdsRoutingService<S> {
     inner: S,
     /// The router used to make routing decisions based on the request.
     router: Arc<dyn Router>,
-    /// Authority to use when the request URI has no authority component.
-    ///
-    /// gRPC requests carry path-only URIs (e.g. `/pkg.Svc/Method`), so the
-    /// authority is always absent at this layer. We fall back to the xDS target
-    /// (e.g. `myservice:50051` from `xds:///myservice:50051`).
-    default_authority: Arc<str>,
 }
 
 impl<S, B> Service<Request<B>> for XdsRoutingService<S>
@@ -65,13 +59,11 @@ where
     fn call(&mut self, mut request: Request<B>) -> Self::Future {
         let router = self.router.clone();
         let mut inner_service = self.inner.clone();
-        let default_authority = self.default_authority.clone();
         Box::pin(async move {
             let authority = request
                 .uri()
                 .authority()
-                .map(http::uri::Authority::as_str)
-                .unwrap_or(&default_authority);
+                .map_or("*", http::uri::Authority::as_str);
             let headers = &request.headers();
             let route_input = RouteInput { authority, headers };
             let route_decision = router.route(&route_input).await?;
@@ -86,20 +78,12 @@ where
 #[allow(dead_code)]
 pub(crate) struct XdsRoutingLayer {
     router: Arc<dyn Router>,
-    default_authority: Arc<str>,
 }
 
 impl XdsRoutingLayer {
-    /// Creates a new `XdsRoutingLayer` with the given [`Router`] and default authority.
-    ///
-    /// `default_authority` is used when a request URI has no authority component,
-    /// which is always the case for gRPC requests at this layer.
     #[allow(dead_code)]
-    pub(crate) fn new(router: Arc<dyn Router>, default_authority: impl Into<Arc<str>>) -> Self {
-        Self {
-            router,
-            default_authority: default_authority.into(),
-        }
+    pub(crate) fn new(router: Arc<dyn Router>) -> Self {
+        Self { router }
     }
 }
 
@@ -110,7 +94,6 @@ impl<S> Layer<S> for XdsRoutingLayer {
         XdsRoutingService {
             inner: service,
             router: self.router.clone(),
-            default_authority: self.default_authority.clone(),
         }
     }
 }
