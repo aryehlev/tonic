@@ -599,6 +599,125 @@ mod tests {
         );
     }
 
+    /// TCP proxy that can be switched "dark": both sockets stay open but
+    /// bytes stop flowing in either direction, simulating a half-open
+    /// connection to a dead peer (deleted pod IP, dropped NAT entry, ...).
+    async fn start_blackholeable_proxy(
+        upstream: SocketAddr,
+    ) -> (SocketAddr, Arc<std::sync::atomic::AtomicBool>) {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let dark = Arc::new(AtomicBool::new(false));
+        let dark_accept = dark.clone();
+        tokio::spawn(async move {
+            loop {
+                let (mut client, _) = listener.accept().await.unwrap();
+                let mut server = tokio::net::TcpStream::connect(upstream).await.unwrap();
+                let dark = dark_accept.clone();
+                tokio::spawn(async move {
+                    let (mut cr, mut cw) = client.split();
+                    let (mut sr, mut sw) = server.split();
+                    let c2s = async {
+                        let mut buf = [0u8; 16384];
+                        loop {
+                            let n = cr.read(&mut buf).await.unwrap_or(0);
+                            if n == 0 {
+                                break;
+                            }
+                            // Dark: swallow the bytes, keep the socket open.
+                            if dark.load(Ordering::SeqCst) {
+                                continue;
+                            }
+                            if sw.write_all(&buf[..n]).await.is_err() {
+                                break;
+                            }
+                        }
+                    };
+                    let s2c = async {
+                        let mut buf = [0u8; 16384];
+                        loop {
+                            let n = sr.read(&mut buf).await.unwrap_or(0);
+                            if n == 0 {
+                                break;
+                            }
+                            if dark.load(Ordering::SeqCst) {
+                                continue;
+                            }
+                            if cw.write_all(&buf[..n]).await.is_err() {
+                                break;
+                            }
+                        }
+                    };
+                    tokio::join!(c2s, s2c);
+                });
+            }
+        });
+        (addr, dark)
+    }
+
+    async fn stream_through_proxy(
+        proxy_addr: SocketAddr,
+        keep_alive: Option<Duration>,
+    ) -> TonicAdsStream {
+        let transport = TonicTransportBuilder::new()
+            .with_keep_alive(keep_alive, Duration::from_millis(300))
+            .build(&ServerConfig::new(format!("http://{proxy_addr}")))
+            .await
+            .unwrap();
+        let request = DiscoveryRequest {
+            type_url: "type.googleapis.com/envoy.config.listener.v3.Listener".to_string(),
+            ..Default::default()
+        };
+        let request_bytes: Bytes = request.encode_to_vec().into();
+        let mut stream = transport.new_stream(vec![request_bytes]).await.unwrap();
+        // Healthy connection: the echo response arrives.
+        let response = stream.recv().await.unwrap().unwrap();
+        let response = DiscoveryResponse::decode(response).unwrap();
+        assert_eq!(response.version_info, "1");
+        stream
+    }
+
+    #[tokio::test]
+    async fn keepalive_surfaces_half_open_connection() {
+        let server_addr = start_mock_server(None).await;
+        let (proxy_addr, dark) = start_blackholeable_proxy(server_addr).await;
+        let mut stream =
+            stream_through_proxy(proxy_addr, Some(Duration::from_millis(300))).await;
+
+        // Kill the path while keeping the sockets open.
+        dark.store(true, std::sync::atomic::Ordering::SeqCst);
+
+        // The unanswered keepalive PING must tear the connection down and
+        // terminate the stream well before any application-level deadline.
+        let item = tokio::time::timeout(Duration::from_secs(10), stream.recv())
+            .await
+            .expect("keepalive should surface the dead connection, not pend forever");
+        assert!(
+            matches!(item, Err(_) | Ok(None)),
+            "expected stream end or transport error after keepalive timeout, got {item:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn without_keepalive_half_open_connection_pends() {
+        let server_addr = start_mock_server(None).await;
+        let (proxy_addr, dark) = start_blackholeable_proxy(server_addr).await;
+        let mut stream = stream_through_proxy(proxy_addr, None).await;
+
+        dark.store(true, std::sync::atomic::Ordering::SeqCst);
+
+        // Control for the test above: with keepalives disabled nothing probes
+        // the connection, so the dead peer goes unnoticed and recv() pends.
+        let result = tokio::time::timeout(Duration::from_secs(3), stream.recv()).await;
+        assert!(
+            result.is_err(),
+            "recv() should still be pending on a half-open connection without keepalives"
+        );
+    }
+
     #[tokio::test]
     async fn test_tonic_transport_connect_and_stream() {
         let addr = start_mock_server(None).await;
