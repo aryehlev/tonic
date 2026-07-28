@@ -227,7 +227,9 @@ impl XdsClient {
     /// ```
     pub async fn watch<T: Resource>(&self, name: impl Into<String>) -> ResourceWatcher<T> {
         let mut watchers = self.watch_many::<T>([name]).await;
-        watchers.pop().expect("watch_many returns one watcher per name")
+        watchers
+            .pop()
+            .expect("watch_many returns one watcher per name")
     }
 
     /// Watch multiple resources of the same type in a single request.
@@ -267,7 +269,11 @@ impl XdsClient {
                 event_tx,
                 decoder: decoder_for::<T>(),
             });
-            watchers.push(ResourceWatcher::new(event_rx, watcher_id, self.command_tx.clone()));
+            watchers.push(ResourceWatcher::new(
+                event_rx,
+                watcher_id,
+                self.command_tx.clone(),
+            ));
         }
 
         let _ = self

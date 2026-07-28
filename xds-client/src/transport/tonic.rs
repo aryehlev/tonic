@@ -298,7 +298,7 @@ impl TonicTransportBuilder {
     /// when secure, `http` otherwise). This also lets tonic derive SNI from
     /// `uri.host()` on the secure path. Non-`http::Uri` inputs (`unix://`) and
     /// URIs that already carry a scheme are left as-is.
-    fn ensure_secure_server_uri(raw: &str, secure: bool) -> String {
+    fn ensure_server_uri_scheme(raw: &str, secure: bool) -> String {
         if let Ok(uri) = raw.parse::<http::Uri>()
             && uri.scheme().is_none()
         {
@@ -332,7 +332,7 @@ impl TransportBuilder for TonicTransportBuilder {
 
         // `Endpoint::from_shared` routes `unix://` URIs to tonic's UDS connector.
         // Required for control planes like Istio's grpc-agent that ship `unix:///etc/istio/proxy/XDS`.
-        let endpoint = Endpoint::from_shared(Self::ensure_secure_server_uri(server.uri(), secure))
+        let endpoint = Endpoint::from_shared(Self::ensure_server_uri_scheme(server.uri(), secure))
             .map_err(|e| Error::Connection(e.to_string()))?;
 
         let mut endpoint = endpoint.connect_timeout(self.connect_timeout);
@@ -606,38 +606,35 @@ mod tests {
     }
 
     #[test]
-    fn ensure_secure_server_uri_adds_scheme_matching_security_mode() {
+    fn ensure_server_uri_scheme_adds_scheme_matching_security_mode() {
         assert_eq!(
-            TonicTransportBuilder::ensure_secure_server_uri(
+            TonicTransportBuilder::ensure_server_uri_scheme(
                 "trafficdirector.googleapis.com:443",
                 true
             ),
             "https://trafficdirector.googleapis.com:443",
         );
         assert_eq!(
-            TonicTransportBuilder::ensure_secure_server_uri("https://xds.example.com:443", true),
+            TonicTransportBuilder::ensure_server_uri_scheme("https://xds.example.com:443", true),
             "https://xds.example.com:443"
         );
         assert_eq!(
-            TonicTransportBuilder::ensure_secure_server_uri("unix:///etc/istio/proxy/XDS", true),
+            TonicTransportBuilder::ensure_server_uri_scheme("unix:///etc/istio/proxy/XDS", true),
             "unix:///etc/istio/proxy/XDS"
         );
         // Istio's plaintext xDS port is scheme-less and paired with `insecure`
         // channel creds — this used to fail to connect at all (regression test
         // for that bug).
         assert_eq!(
-            TonicTransportBuilder::ensure_secure_server_uri(
-                "istiod.istio-system.svc:15010",
-                false
-            ),
+            TonicTransportBuilder::ensure_server_uri_scheme("istiod.istio-system.svc:15010", false),
             "http://istiod.istio-system.svc:15010"
         );
         assert_eq!(
-            TonicTransportBuilder::ensure_secure_server_uri("http://127.0.0.1:18000", false),
+            TonicTransportBuilder::ensure_server_uri_scheme("http://127.0.0.1:18000", false),
             "http://127.0.0.1:18000"
         );
         assert_eq!(
-            TonicTransportBuilder::ensure_secure_server_uri("unix:///etc/istio/proxy/XDS", false),
+            TonicTransportBuilder::ensure_server_uri_scheme("unix:///etc/istio/proxy/XDS", false),
             "unix:///etc/istio/proxy/XDS"
         );
     }

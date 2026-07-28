@@ -157,7 +157,30 @@ impl CascadeState {
                 Some((name, event)) = self.cds_watchers.next(),
                     if !self.cds_watchers.is_empty() =>
                 {
-                    self.handle_cds(&name, event, &xds_client, &cache).await;
+                    // Drain every CDS event already buffered (not just this
+                    // one) before issuing EDS watches, so a burst of CDS
+                    // responses — e.g. right after `reconcile_clusters`'s
+                    // batched request comes back — results in one batched
+                    // EDS `watch_many` instead of one `watch()` per cluster.
+                    let mut needed_eds = Vec::new();
+                    if let Some(entry) = self.handle_cds(&name, event, &cache) {
+                        needed_eds.push(entry);
+                    }
+                    while let Ok(Some((name, event))) =
+                        tokio::time::timeout(std::time::Duration::ZERO, self.cds_watchers.next()).await
+                    {
+                        if let Some(entry) = self.handle_cds(&name, event, &cache) {
+                            needed_eds.push(entry);
+                        }
+                    }
+                    if !needed_eds.is_empty() {
+                        let eds_names: Vec<String> =
+                            needed_eds.iter().map(|(_, eds_name)| eds_name.clone()).collect();
+                        let watchers = xds_client.watch_many::<EndpointsResource>(eds_names).await;
+                        for ((cluster_name, _), watcher) in needed_eds.into_iter().zip(watchers) {
+                            self.eds_watchers.insert(cluster_name, WatcherStream(watcher));
+                        }
+                    }
                 }
 
                 Some((name, event)) = self.eds_watchers.next(),
@@ -231,13 +254,22 @@ impl CascadeState {
         }
     }
 
-    async fn handle_cds(
+    /// Handles a single CDS event, updating the cache and (if the cluster's
+    /// EDS service name changed) returning `(cluster_name, eds_name)` for a
+    /// new EDS watch the caller should register.
+    ///
+    /// Deliberately does *not* call `watch()` itself: many CDS responses can
+    /// land in the same burst (e.g. right after a batched `reconcile_clusters`
+    /// call gets a wave of ACKs back), and watching one EDS name at a time in
+    /// a tight loop reproduces the exact request-flood problem
+    /// `reconcile_clusters` was fixed to avoid. See [`Self::run`], which
+    /// drains all ready CDS events and issues one batched EDS `watch_many`.
+    fn handle_cds(
         &mut self,
         cluster_name: &str,
         event: ResourceEvent<ClusterResource>,
-        xds_client: &XdsClient,
         cache: &Arc<XdsCache>,
-    ) {
+    ) -> Option<(String, String)> {
         match event {
             ResourceEvent::ResourceChanged {
                 result: Ok(cluster),
@@ -246,20 +278,21 @@ impl CascadeState {
                 cache.update_cluster(cluster_name, Arc::clone(&cluster));
 
                 let eds_name = cluster.eds_service_name().to_string();
-                if self.eds_names.get(cluster_name).map(|s| s.as_str()) != Some(&eds_name) {
-                    self.eds_watchers.remove(cluster_name);
-
-                    let watcher = xds_client.watch::<EndpointsResource>(&eds_name).await;
-                    let cluster_key = cluster_name.to_string();
-                    self.eds_watchers
-                        .insert(cluster_key.clone(), WatcherStream(watcher));
-                    self.eds_names.insert(cluster_key, eds_name);
-                }
+                let needs_watch =
+                    self.eds_names.get(cluster_name).map(|s| s.as_str()) != Some(&eds_name);
                 drop(done);
+                if needs_watch {
+                    self.eds_watchers.remove(cluster_name);
+                    self.eds_names
+                        .insert(cluster_name.to_string(), eds_name.clone());
+                    Some((cluster_name.to_string(), eds_name))
+                } else {
+                    None
+                }
             }
             // Per gRFC A88: keep using cached resources on data errors.
             ResourceEvent::ResourceChanged { result: Err(_), .. }
-            | ResourceEvent::AmbientError { .. } => {}
+            | ResourceEvent::AmbientError { .. } => None,
         }
     }
 
@@ -312,7 +345,8 @@ impl CascadeState {
                 .watch_many::<ClusterResource>(added_names.clone())
                 .await;
             for (name, watcher) in added_names.into_iter().zip(new_watchers) {
-                self.cds_watchers.insert(name, WatcherStream(watcher));
+                self.cds_watchers
+                    .insert(name, WatcherStream(watcher));
             }
         }
     }
@@ -329,9 +363,15 @@ mod tests {
     /// DIAGNOSTIC (not a regression test): runs the real LDS->RDS->CDS cascade
     /// — via the actual `reconcile_clusters()` production code path — against
     /// a live istiod (`kubectl port-forward -n istio-system pod/<istiod> 15010:15010`)
-    /// with the exact node identity/target of the real filtration pod, to
-    /// verify the CDS batching fix actually resolves the target cluster.
+    /// to verify the CDS batching fix actually resolves the target cluster.
     /// `#[ignore]`d so it doesn't run in CI or need network access.
+    ///
+    /// Configure via env vars (defaults target a service `my-service` on port
+    /// 50051 in namespace `default`, via a local port-forward on 15010):
+    ///   XDS_DIAG_SERVER   xDS server URI
+    ///   XDS_DIAG_NODE_ID  Istio node id (`sidecar~<pod-ip>~<pod>.<ns>~cluster.local`)
+    ///   XDS_DIAG_SERVICE  target service FQDN
+    ///   XDS_DIAG_PORT     target service port
     ///
     /// Run with:
     ///   cargo test -p tonic-xds --lib xds::resource_manager::tests::diagnose_real_cascade -- --ignored --nocapture
@@ -339,20 +379,37 @@ mod tests {
     #[ignore]
     async fn diagnose_real_cascade() {
         use xds_client::message::MetadataValue;
-        use xds_client::{ClientConfig, Node, ProstCodec, TokioRuntime, TonicTransportBuilder, XdsClient as RealXdsClient};
+        use xds_client::{
+            ClientConfig, Node, ProstCodec, TokioRuntime, TonicTransportBuilder,
+            XdsClient as RealXdsClient,
+        };
+
+        let env =
+            |key: &str, default: &str| std::env::var(key).unwrap_or_else(|_| default.to_string());
+        let server = env("XDS_DIAG_SERVER", "http://127.0.0.1:15010");
+        let node_id = env(
+            "XDS_DIAG_NODE_ID",
+            "sidecar~10.0.0.1~my-pod.default~cluster.local",
+        );
+        let service = env("XDS_DIAG_SERVICE", "my-service.default.svc.cluster.local");
+        let port = env("XDS_DIAG_PORT", "50051");
 
         let mut metadata = std::collections::HashMap::new();
-        metadata.insert("GENERATOR".to_string(), MetadataValue::String("grpc".to_string()));
+        metadata.insert(
+            "GENERATOR".to_string(),
+            MetadataValue::String("grpc".to_string()),
+        );
 
         let node = Node::new("grpc", "1.0")
-            .with_id("sidecar~10.4.10.31~test-aryeh-fix-filtration-6cdf85b654-d75gm.default~cluster.local")
+            .with_id(node_id)
             .with_metadata(metadata);
 
-        let listener_name = "rtb-seller-digital.default.svc.cluster.local:50051".to_string();
-        let target_cluster = "outbound|50051||rtb-seller-digital.default.svc.cluster.local";
+        let listener_name = format!("{service}:{port}");
+        let target_cluster = format!("outbound|{port}||{service}");
+        let target_cluster = target_cluster.as_str();
 
-        let client_config = ClientConfig::new(node, "http://127.0.0.1:15010")
-            .with_target(format!("xds:///{listener_name}"));
+        let client_config =
+            ClientConfig::new(node, server).with_target(format!("xds:///{listener_name}"));
 
         let xds_client: RealXdsClient = RealXdsClient::builder(
             client_config,
@@ -364,13 +421,17 @@ mod tests {
 
         eprintln!("DIAG: watching Listener '{listener_name}'");
         let mut lds_watcher = xds_client.watch::<ListenerResource>(&listener_name).await;
-        let lds_event = tokio::time::timeout(std::time::Duration::from_secs(10), lds_watcher.next())
-            .await
-            .expect("LDS timed out")
-            .expect("LDS watcher closed");
+        let lds_event =
+            tokio::time::timeout(std::time::Duration::from_secs(10), lds_watcher.next())
+                .await
+                .expect("LDS timed out")
+                .expect("LDS watcher closed");
 
         let rds_name = match lds_event {
-            ResourceEvent::ResourceChanged { result: Ok(listener), done } => {
+            ResourceEvent::ResourceChanged {
+                result: Ok(listener),
+                done,
+            } => {
                 eprintln!("DIAG: LDS OK: route_source = {:?}", listener.route_source);
                 drop(done);
                 match &listener.route_source {
@@ -383,14 +444,22 @@ mod tests {
 
         eprintln!("DIAG: watching RouteConfiguration '{rds_name}'");
         let mut rds_watcher = xds_client.watch::<RouteConfigResource>(&rds_name).await;
-        let rds_event = tokio::time::timeout(std::time::Duration::from_secs(10), rds_watcher.next())
-            .await
-            .expect("RDS timed out")
-            .expect("RDS watcher closed");
+        let rds_event =
+            tokio::time::timeout(std::time::Duration::from_secs(10), rds_watcher.next())
+                .await
+                .expect("RDS timed out")
+                .expect("RDS watcher closed");
 
         let rc = match rds_event {
-            ResourceEvent::ResourceChanged { result: Ok(rc), done } => {
-                eprintln!("DIAG: RDS OK: {} virtual hosts, {} clusters referenced", rc.virtual_hosts.len(), rc.cluster_names().len());
+            ResourceEvent::ResourceChanged {
+                result: Ok(rc),
+                done,
+            } => {
+                eprintln!(
+                    "DIAG: RDS OK: {} virtual hosts, {} clusters referenced",
+                    rc.virtual_hosts.len(),
+                    rc.cluster_names().len()
+                );
                 drop(done);
                 rc
             }
@@ -402,36 +471,78 @@ mod tests {
         let cache = test_cache();
         let mut state = CascadeState::new();
         state.reconcile_clusters(&rc, &xds_client, &cache).await;
-        eprintln!("DIAG: reconcile_clusters() (batched) returned in {:?}", start.elapsed());
+        eprintln!(
+            "DIAG: reconcile_clusters() (batched) returned in {:?}",
+            start.elapsed()
+        );
         assert!(
             state.cds_watchers.contains_key(target_cluster),
             "target cluster should be registered after reconcile_clusters()"
         );
 
-        // Wait for the actual CDS response to land in the cache (what a real
-        // request would block on before it can route to an endpoint), while
-        // concurrently driving the cascade so cds_watchers' events get processed.
-        let mut target_cache_watch = cache.watch_cluster(target_cluster);
-        let result = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        // Wait for the actual CDS *and* EDS responses to land in the cache
+        // (what a real request would block on before it can route to an
+        // endpoint), while concurrently driving the cascade — including
+        // batched EDS watches, exactly like `CascadeState::run` — so events
+        // actually get processed instead of sitting unread.
+        let mut target_cluster_watch = cache.watch_cluster(target_cluster);
+        let cluster = tokio::time::timeout(std::time::Duration::from_secs(30), async {
             loop {
                 tokio::select! {
-                    cluster = target_cache_watch.next() => {
+                    cluster = target_cluster_watch.next() => {
                         if let Some(cluster) = cluster {
                             return cluster;
                         }
                     }
                     Some((name, event)) = state.cds_watchers.next() => {
-                        state.handle_cds(&name, event, &xds_client, &cache).await;
+                        let mut needed_eds = Vec::new();
+                        if let Some(entry) = state.handle_cds(&name, event, &cache) {
+                            needed_eds.push(entry);
+                        }
+                        while let Ok(Some((name, event))) =
+                            tokio::time::timeout(std::time::Duration::ZERO, state.cds_watchers.next()).await
+                        {
+                            if let Some(entry) = state.handle_cds(&name, event, &cache) {
+                                needed_eds.push(entry);
+                            }
+                        }
+                        if !needed_eds.is_empty() {
+                            let eds_names: Vec<String> =
+                                needed_eds.iter().map(|(_, n)| n.clone()).collect();
+                            eprintln!("DIAG: batching {} EDS watch(es)", eds_names.len());
+                            let watchers = xds_client.watch_many::<EndpointsResource>(eds_names).await;
+                            for ((cluster_name, _), watcher) in needed_eds.into_iter().zip(watchers) {
+                                state.eds_watchers.insert(cluster_name, WatcherStream(watcher));
+                            }
+                        }
                     }
                 }
             }
         })
-        .await;
+        .await
+        .unwrap_or_else(|_| panic!("DIAG: CDS for '{target_cluster}' never landed in cache after {:?}", start.elapsed()));
+        eprintln!("DIAG: CDS OK after {:?}: {cluster:?}", start.elapsed());
 
-        match result {
-            Ok(cluster) => eprintln!("DIAG: CDS OK after {:?}: {cluster:?}", start.elapsed()),
-            Err(_) => panic!("DIAG: CDS for '{target_cluster}' never landed in cache after {:?}", start.elapsed()),
-        }
+        // Now wait for EDS (actual endpoint addresses) for our cluster.
+        let eds_name = cluster.eds_service_name().to_string();
+        let mut target_eds_watch = cache.watch_endpoints(&eds_name);
+        let endpoints = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            loop {
+                tokio::select! {
+                    endpoints = target_eds_watch.next() => {
+                        if let Some(endpoints) = endpoints {
+                            return endpoints;
+                        }
+                    }
+                    Some((name, event)) = state.eds_watchers.next() => {
+                        state.handle_eds(&name, event, &cache);
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("DIAG: EDS for '{eds_name}' never landed in cache after {:?}", start.elapsed()));
+        eprintln!("DIAG: EDS OK after {:?}: {endpoints:?}", start.elapsed());
     }
 
     fn test_client() -> XdsClient {

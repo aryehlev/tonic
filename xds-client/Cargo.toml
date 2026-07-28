@@ -52,6 +52,7 @@ tonic = { version = "0.14" }
 async-stream = "0.3"
 envoy-types = "0.7"
 prost = "0.14"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [[example]]
 name = "basic"
