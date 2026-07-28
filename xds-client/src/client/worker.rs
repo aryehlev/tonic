@@ -239,20 +239,34 @@ impl Default for WatcherId {
     }
 }
 
+/// A single subscription entry within a [`WorkerCommand::WatchMany`] batch.
+pub(crate) struct WatchEntry {
+    /// The resource name (empty string for wildcard subscription).
+    pub(crate) name: String,
+    /// Unique identifier for this watcher.
+    pub(crate) watcher_id: WatcherId,
+    /// Channel to send resource events to the watcher.
+    pub(crate) event_tx: mpsc::Sender<ResourceEvent<DecodedResource>>,
+    /// Decoder function for this resource type. Only the first entry's decoder
+    /// in a batch is actually stored (per type_url); the rest are discarded if
+    /// the type is already known — see [`AdsWorker::add_watcher`].
+    pub(crate) decoder: DecoderFn,
+}
+
 /// Commands sent from `XdsClient` to the worker.
 pub(crate) enum WorkerCommand {
-    /// Subscribe to a resource.
-    Watch {
+    /// Subscribe to one or more resources of the same type in one request.
+    ///
+    /// All entries are applied to the subscription state before at most one
+    /// `DiscoveryRequest` is sent — critical when registering many names at
+    /// once (e.g. every cluster referenced by a route config): sending one
+    /// request per name in a tight loop, each with an unacknowledged nonce,
+    /// can prevent the server from ever settling on a response.
+    WatchMany {
         /// The type URL of the resource.
         type_url: &'static str,
-        /// The resource name (empty string for wildcard subscription).
-        name: String,
-        /// Unique identifier for this watcher.
-        watcher_id: WatcherId,
-        /// Channel to send resource events to the watcher.
-        event_tx: mpsc::Sender<ResourceEvent<DecodedResource>>,
-        /// Decoder function for this resource type.
-        decoder: DecoderFn,
+        /// The subscriptions to add.
+        entries: Vec<WatchEntry>,
         /// Whether all resources must be present in SotW responses (per A53).
         all_resources_required_in_sotw: bool,
     },
@@ -801,23 +815,30 @@ where
         cmd: WorkerCommand,
     ) -> Result<()> {
         match cmd {
-            WorkerCommand::Watch {
+            WorkerCommand::WatchMany {
                 type_url,
-                name,
-                watcher_id,
-                event_tx,
-                decoder,
+                entries,
                 all_resources_required_in_sotw,
             } => {
-                if self.add_watcher(
-                    type_url,
-                    name,
-                    watcher_id,
-                    event_tx,
-                    decoder,
-                    all_resources_required_in_sotw,
-                ) && let Some(stream) = stream
-                {
+                // Apply every entry to the subscription state first, and send
+                // at most one DiscoveryRequest for the whole batch — not one
+                // per entry — so a large batch (e.g. every cluster referenced
+                // by a route config) doesn't flood the server with rapid,
+                // individually-unacknowledged requests.
+                let mut any_changed = false;
+                for entry in entries {
+                    if self.add_watcher(
+                        type_url,
+                        entry.name,
+                        entry.watcher_id,
+                        entry.event_tx,
+                        entry.decoder,
+                        all_resources_required_in_sotw,
+                    ) {
+                        any_changed = true;
+                    }
+                }
+                if any_changed && let Some(stream) = stream {
                     self.send_request(stream, type_url).await?;
                 }
             }

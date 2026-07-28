@@ -31,7 +31,7 @@ use tokio::sync::mpsc;
 
 use crate::client::config::ClientConfig;
 use crate::client::watch::ResourceWatcher;
-use crate::client::worker::{AdsWorker, WatcherId, WorkerCommand};
+use crate::client::worker::{AdsWorker, WatchEntry, WatcherId, WorkerCommand};
 use crate::codec::XdsCodec;
 use crate::metrics::MetricsRecorder;
 use crate::resource::{DecodedResource, DecoderFn, Resource};
@@ -42,6 +42,28 @@ pub mod config;
 pub mod retry;
 pub mod watch;
 pub mod worker;
+
+/// Builds a [`DecoderFn`] for resource type `T`.
+///
+/// Factored out of `watch`/`watch_many` since a batch of watches for the same
+/// type needs one decoder per entry (the worker only keeps the first — see
+/// `watch_many`), and both call sites need the identical decode-and-wrap logic.
+fn decoder_for<T: Resource>() -> DecoderFn {
+    Box::new(|bytes| match crate::resource::decode::<T>(bytes) {
+        crate::resource::DecodeResult::Success { name, resource } => {
+            crate::resource::DecodeResult::Success {
+                name: name.clone(),
+                resource: DecodedResource::new(name, resource),
+            }
+        }
+        crate::resource::DecodeResult::ResourceError { name, error } => {
+            crate::resource::DecodeResult::ResourceError { name, error }
+        }
+        crate::resource::DecodeResult::TopLevelError(error) => {
+            crate::resource::DecodeResult::TopLevelError(error)
+        }
+    })
+}
 
 /// Builder for [`XdsClient`].
 pub struct XdsClientBuilder<TB, C, R> {
@@ -204,38 +226,60 @@ impl XdsClient {
     /// }
     /// ```
     pub async fn watch<T: Resource>(&self, name: impl Into<String>) -> ResourceWatcher<T> {
-        let name = name.into();
-        let watcher_id = WatcherId::new();
-        let (event_tx, event_rx) = mpsc::channel(WATCHER_CHANNEL_BUFFER_SIZE);
+        let mut watchers = self.watch_many::<T>([name]).await;
+        watchers.pop().expect("watch_many returns one watcher per name")
+    }
 
-        let decoder: DecoderFn = Box::new(|bytes| match crate::resource::decode::<T>(bytes) {
-            crate::resource::DecodeResult::Success { name, resource } => {
-                crate::resource::DecodeResult::Success {
-                    name: name.clone(),
-                    resource: DecodedResource::new(name, resource),
-                }
-            }
-            crate::resource::DecodeResult::ResourceError { name, error } => {
-                crate::resource::DecodeResult::ResourceError { name, error }
-            }
-            crate::resource::DecodeResult::TopLevelError(error) => {
-                crate::resource::DecodeResult::TopLevelError(error)
-            }
-        });
+    /// Watch multiple resources of the same type in a single request.
+    ///
+    /// Unlike calling [`watch`](Self::watch) in a loop — which sends one
+    /// `DiscoveryRequest` per name, since each call independently changes the
+    /// subscription set — this registers all `names` atomically and sends at
+    /// most one combined request. This matters when a route config references
+    /// many clusters (or any other batch of same-type resources): firing N
+    /// separate requests in a tight loop, each with an unacknowledged nonce,
+    /// can prevent the server from ever settling on a response.
+    ///
+    /// Returns one [`ResourceWatcher`] per name, in the same order as `names`.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let watchers = client.watch_many::<Cluster>(cluster_names).await;
+    /// ```
+    pub async fn watch_many<T: Resource>(
+        &self,
+        names: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Vec<ResourceWatcher<T>> {
+        let mut entries = Vec::new();
+        let mut watchers = Vec::new();
 
-        let _ = self
-            .command_tx
-            .send(WorkerCommand::Watch {
-                type_url: T::TYPE_URL.as_str(),
+        for name in names {
+            let name = name.into();
+            let watcher_id = WatcherId::new();
+            let (event_tx, event_rx) = mpsc::channel(WATCHER_CHANNEL_BUFFER_SIZE);
+            // Only the first entry's decoder is actually stored (per type_url);
+            // the worker discards the rest if the type is already known. Cheap
+            // to build one per entry rather than thread an `Option` through.
+            entries.push(WatchEntry {
                 name,
                 watcher_id,
                 event_tx,
-                decoder,
+                decoder: decoder_for::<T>(),
+            });
+            watchers.push(ResourceWatcher::new(event_rx, watcher_id, self.command_tx.clone()));
+        }
+
+        let _ = self
+            .command_tx
+            .send(WorkerCommand::WatchMany {
+                type_url: T::TYPE_URL.as_str(),
+                entries,
                 all_resources_required_in_sotw: T::ALL_RESOURCES_REQUIRED_IN_SOTW,
             })
             .await;
 
-        ResourceWatcher::new(event_rx, watcher_id, self.command_tx.clone())
+        watchers
     }
 
     /// Creates a disconnected client with no backing worker.

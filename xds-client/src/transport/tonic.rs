@@ -288,17 +288,22 @@ impl TonicTransportBuilder {
         self
     }
 
-    /// Prepend `https://` to a scheme-less `server_uri` on the secure path.
+    /// Prepend a scheme to a scheme-less `server_uri`.
     ///
-    /// Bootstrap URIs like `trafficdirector.googleapis.com:443` parse with no scheme,
-    /// so `Endpoint` won't negotiate TLS. A scheme lets it, and tonic derive SNI from
-    /// `uri.host()`. Non-`http::Uri` inputs (`unix://`) and plaintext are left as-is.
+    /// Bootstrap URIs are commonly given as bare `host:port` with no scheme
+    /// (e.g. `trafficdirector.googleapis.com:443`, or Istio's plaintext xDS
+    /// port `istiod.istio-system.svc:15010`). `Endpoint::from_shared` requires
+    /// a scheme to connect — without one, `.connect()` fails outright — so one
+    /// is always added here, matching the channel's security mode (`https`
+    /// when secure, `http` otherwise). This also lets tonic derive SNI from
+    /// `uri.host()` on the secure path. Non-`http::Uri` inputs (`unix://`) and
+    /// URIs that already carry a scheme are left as-is.
     fn ensure_secure_server_uri(raw: &str, secure: bool) -> String {
-        if secure
-            && let Ok(uri) = raw.parse::<http::Uri>()
+        if let Ok(uri) = raw.parse::<http::Uri>()
             && uri.scheme().is_none()
         {
-            return format!("https://{raw}");
+            let scheme = if secure { "https" } else { "http" };
+            return format!("{scheme}://{raw}");
         }
         raw.to_string()
     }
@@ -601,7 +606,7 @@ mod tests {
     }
 
     #[test]
-    fn ensure_secure_server_uri_adds_scheme_only_when_needed() {
+    fn ensure_secure_server_uri_adds_scheme_matching_security_mode() {
         assert_eq!(
             TonicTransportBuilder::ensure_secure_server_uri(
                 "trafficdirector.googleapis.com:443",
@@ -617,9 +622,23 @@ mod tests {
             TonicTransportBuilder::ensure_secure_server_uri("unix:///etc/istio/proxy/XDS", true),
             "unix:///etc/istio/proxy/XDS"
         );
+        // Istio's plaintext xDS port is scheme-less and paired with `insecure`
+        // channel creds — this used to fail to connect at all (regression test
+        // for that bug).
         assert_eq!(
-            TonicTransportBuilder::ensure_secure_server_uri("127.0.0.1:18000", false),
-            "127.0.0.1:18000"
+            TonicTransportBuilder::ensure_secure_server_uri(
+                "istiod.istio-system.svc:15010",
+                false
+            ),
+            "http://istiod.istio-system.svc:15010"
+        );
+        assert_eq!(
+            TonicTransportBuilder::ensure_secure_server_uri("http://127.0.0.1:18000", false),
+            "http://127.0.0.1:18000"
+        );
+        assert_eq!(
+            TonicTransportBuilder::ensure_secure_server_uri("unix:///etc/istio/proxy/XDS", false),
+            "unix:///etc/istio/proxy/XDS"
         );
     }
 

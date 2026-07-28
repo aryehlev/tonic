@@ -301,10 +301,19 @@ impl CascadeState {
             cache.remove_endpoints(name);
         }
 
-        for name in new_clusters.difference(&old_clusters) {
-            let watcher = xds_client.watch::<ClusterResource>(name).await;
-            self.cds_watchers
-                .insert(name.clone(), WatcherStream(watcher));
+        // Register all newly-referenced clusters in one request rather than
+        // one `watch()` per name: a route config can reference many clusters
+        // (e.g. Istio shares one RouteConfiguration across every service on a
+        // port), and firing N separate, individually-unacknowledged requests
+        // in a tight loop can prevent the server from ever responding.
+        let added_names: Vec<String> = new_clusters.difference(&old_clusters).cloned().collect();
+        if !added_names.is_empty() {
+            let new_watchers = xds_client
+                .watch_many::<ClusterResource>(added_names.clone())
+                .await;
+            for (name, watcher) in added_names.into_iter().zip(new_watchers) {
+                self.cds_watchers.insert(name, WatcherStream(watcher));
+            }
         }
     }
 }
@@ -316,6 +325,114 @@ mod tests {
         PathSpecifierConfig, RouteConfig, RouteConfigAction, RouteConfigMatch, VirtualHostConfig,
     };
     use xds_client::ProcessingDone;
+
+    /// DIAGNOSTIC (not a regression test): runs the real LDS->RDS->CDS cascade
+    /// — via the actual `reconcile_clusters()` production code path — against
+    /// a live istiod (`kubectl port-forward -n istio-system pod/<istiod> 15010:15010`)
+    /// with the exact node identity/target of the real filtration pod, to
+    /// verify the CDS batching fix actually resolves the target cluster.
+    /// `#[ignore]`d so it doesn't run in CI or need network access.
+    ///
+    /// Run with:
+    ///   cargo test -p tonic-xds --lib xds::resource_manager::tests::diagnose_real_cascade -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn diagnose_real_cascade() {
+        use xds_client::message::MetadataValue;
+        use xds_client::{ClientConfig, Node, ProstCodec, TokioRuntime, TonicTransportBuilder, XdsClient as RealXdsClient};
+
+        let mut metadata = std::collections::HashMap::new();
+        metadata.insert("GENERATOR".to_string(), MetadataValue::String("grpc".to_string()));
+
+        let node = Node::new("grpc", "1.0")
+            .with_id("sidecar~10.4.10.31~test-aryeh-fix-filtration-6cdf85b654-d75gm.default~cluster.local")
+            .with_metadata(metadata);
+
+        let listener_name = "rtb-seller-digital.default.svc.cluster.local:50051".to_string();
+        let target_cluster = "outbound|50051||rtb-seller-digital.default.svc.cluster.local";
+
+        let client_config = ClientConfig::new(node, "http://127.0.0.1:15010")
+            .with_target(format!("xds:///{listener_name}"));
+
+        let xds_client: RealXdsClient = RealXdsClient::builder(
+            client_config,
+            TonicTransportBuilder::new(),
+            ProstCodec,
+            TokioRuntime,
+        )
+        .build();
+
+        eprintln!("DIAG: watching Listener '{listener_name}'");
+        let mut lds_watcher = xds_client.watch::<ListenerResource>(&listener_name).await;
+        let lds_event = tokio::time::timeout(std::time::Duration::from_secs(10), lds_watcher.next())
+            .await
+            .expect("LDS timed out")
+            .expect("LDS watcher closed");
+
+        let rds_name = match lds_event {
+            ResourceEvent::ResourceChanged { result: Ok(listener), done } => {
+                eprintln!("DIAG: LDS OK: route_source = {:?}", listener.route_source);
+                drop(done);
+                match &listener.route_source {
+                    RouteSource::Rds(name) => name.clone(),
+                    RouteSource::Inline(_) => panic!("DIAG: unexpected inline routes"),
+                }
+            }
+            other => panic!("DIAG: LDS failed: {other:?}"),
+        };
+
+        eprintln!("DIAG: watching RouteConfiguration '{rds_name}'");
+        let mut rds_watcher = xds_client.watch::<RouteConfigResource>(&rds_name).await;
+        let rds_event = tokio::time::timeout(std::time::Duration::from_secs(10), rds_watcher.next())
+            .await
+            .expect("RDS timed out")
+            .expect("RDS watcher closed");
+
+        let rc = match rds_event {
+            ResourceEvent::ResourceChanged { result: Ok(rc), done } => {
+                eprintln!("DIAG: RDS OK: {} virtual hosts, {} clusters referenced", rc.virtual_hosts.len(), rc.cluster_names().len());
+                drop(done);
+                rc
+            }
+            other => panic!("DIAG: RDS failed: {other:?}"),
+        };
+
+        // Exercise the REAL production path: CascadeState::reconcile_clusters().
+        let start = std::time::Instant::now();
+        let cache = test_cache();
+        let mut state = CascadeState::new();
+        state.reconcile_clusters(&rc, &xds_client, &cache).await;
+        eprintln!("DIAG: reconcile_clusters() (batched) returned in {:?}", start.elapsed());
+        assert!(
+            state.cds_watchers.contains_key(target_cluster),
+            "target cluster should be registered after reconcile_clusters()"
+        );
+
+        // Wait for the actual CDS response to land in the cache (what a real
+        // request would block on before it can route to an endpoint), while
+        // concurrently driving the cascade so cds_watchers' events get processed.
+        let mut target_cache_watch = cache.watch_cluster(target_cluster);
+        let result = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            loop {
+                tokio::select! {
+                    cluster = target_cache_watch.next() => {
+                        if let Some(cluster) = cluster {
+                            return cluster;
+                        }
+                    }
+                    Some((name, event)) = state.cds_watchers.next() => {
+                        state.handle_cds(&name, event, &xds_client, &cache).await;
+                    }
+                }
+            }
+        })
+        .await;
+
+        match result {
+            Ok(cluster) => eprintln!("DIAG: CDS OK after {:?}: {cluster:?}", start.elapsed()),
+            Err(_) => panic!("DIAG: CDS for '{target_cluster}' never landed in cache after {:?}", start.elapsed()),
+        }
+    }
 
     fn test_client() -> XdsClient {
         XdsClient::disconnected()
