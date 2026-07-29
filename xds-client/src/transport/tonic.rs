@@ -239,7 +239,10 @@ impl Default for TonicTransportBuilder {
             tls_config: None,
             call_creds: None,
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
-            keep_alive_interval: Some(DEFAULT_KEEP_ALIVE_INTERVAL),
+            // EXPERIMENT (deadlock-nokeepalive branch): keepalives disabled to
+            // reproduce the pre-#2746 half-open-connection behavior in the
+            // blackhole/rollout test. Do NOT merge this branch.
+            keep_alive_interval: None,
             keep_alive_timeout: DEFAULT_KEEP_ALIVE_TIMEOUT,
         }
     }
