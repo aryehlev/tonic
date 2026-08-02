@@ -949,7 +949,13 @@ mod tests {
                 CertProviderRegistry::from_bootstrap(&Default::default(), Default::default())
                     .unwrap(),
             );
-            builder.build_from_cache(cache, registry, xds_client, resource_manager)
+            builder.build_from_cache(
+                Arc::new(crate::client::cluster::ClusterClientRegistryGrpc::new()),
+                cache,
+                registry,
+                xds_client,
+                resource_manager,
+            )
         };
         #[cfg(not(feature = "_tls-any"))]
         let _channel = builder.build_from_cache(

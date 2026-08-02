@@ -576,7 +576,7 @@ mod test {
         // pods beyond that are killed, their addresses lingering black-holed
         // in the stable EDS for one tick before being removed.
         let driver = async {
-            for (step, weight) in [20u32, 40, 60, 80, 100].into_iter().enumerate() {
+            for (step, weight) in [19u32, 33, 61, 87, 100].into_iter().enumerate() {
                 let canary_count = (canary_addrs.len() * weight as usize).div_ceil(100);
                 // dynamicStableScale: the stable subset keeps (100-w)% of its
                 // replicas (never zero while it still carries route weight).
