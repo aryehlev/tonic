@@ -513,10 +513,13 @@ mod tests {
     impl Connector for MockConnector {
         type Service = MockService;
 
-        fn connect(&self, addr: &EndpointAddress) -> BoxFuture<Self::Service> {
+        fn connect(
+            &self,
+            addr: &EndpointAddress,
+        ) -> BoxFuture<Result<Self::Service, tower::BoxError>> {
             let (tx, rx) = tokio::sync::oneshot::channel();
             self.senders.lock().unwrap().insert(addr.clone(), tx);
-            Box::pin(async move { rx.await.unwrap() })
+            Box::pin(async move { Ok(rx.await.unwrap()) })
         }
     }
 

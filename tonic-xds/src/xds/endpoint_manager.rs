@@ -31,7 +31,9 @@
 //! (or any other `Discover`-based balancer) can consume.
 
 use std::collections::HashSet;
+use std::future::poll_fn;
 use std::sync::Arc;
+use std::task::Poll;
 
 use arc_swap::ArcSwap;
 use tokio::sync::mpsc;
@@ -39,8 +41,11 @@ use tokio_stream::wrappers::ReceiverStream;
 use tower::BoxError;
 use tower::discover::Change;
 
-use crate::client::endpoint::{Connector, EndpointAddress};
+use crate::client::endpoint::{
+    CONNECT_BACKOFF_INITIAL, CONNECT_BACKOFF_MAX, Connector, EndpointAddress,
+};
 use crate::client::lb::BoxDiscover;
+use crate::client::loadbalance::keyed_futures::KeyedFutures;
 use crate::xds::cache::CacheWatch;
 use crate::xds::resource::EndpointsResource;
 
@@ -72,22 +77,26 @@ impl<S: Send + 'static> EndpointManager<S> {
         Self { connector }
     }
 
-    /// Returns a stream of endpoint changes for the given cache watch.
+    /// Returns a stream of endpoint changes for the cache watch produced by
+    /// `watch_factory`.
     ///
     /// Diffs each snapshot against the previous set of healthy endpoints,
-    /// emitting `Change::Insert` for new endpoints and `Change::Remove`
-    /// for removed ones.
-    pub(crate) fn discover_endpoints(
-        &self,
-        watch: CacheWatch<EndpointsResource>,
-    ) -> BoxDiscover<EndpointAddress, S> {
+    /// emitting `Change::Insert` for connected new endpoints and
+    /// `Change::Remove` for removed ones. When the watched cache entry is
+    /// removed the stream drains and re-subscribes via `watch_factory`
+    /// instead of ending: `ClusterClientRegistry` caches clients by cluster
+    /// name forever, so a name that leaves the config and later returns
+    /// (e.g. a canary cluster on the next rollout) must keep resolving.
+    pub(crate) fn discover_endpoints<W>(&self, watch_factory: W) -> BoxDiscover<EndpointAddress, S>
+    where
+        W: Fn() -> CacheWatch<EndpointsResource> + Send + 'static,
+    {
         let connector = self.connector.clone();
         let (tx, rx) = mpsc::channel(ENDPOINT_CHANNEL_CAPACITY);
 
-        // The spawned task exits naturally when either:
-        // - The CacheWatch closes (cache.remove_endpoints() drops the watch sender)
-        // - The receiver is dropped (consumer no longer reading Change events)
-        tokio::spawn(diff_loop(watch, connector, tx));
+        // The spawned task exits only when the receiver is dropped
+        // (consumer no longer reading Change events).
+        tokio::spawn(diff_loop(watch_factory, connector, tx));
 
         Box::pin(ReceiverStream::new(rx))
     }
@@ -96,39 +105,108 @@ impl<S: Send + 'static> EndpointManager<S> {
 /// Background task: watches endpoint snapshots and emits incremental changes.
 ///
 /// Each time a new [`EndpointsResource`] arrives from the cache, we diff
-/// `healthy_endpoints()` against the previous set and emit `Insert` for
-/// new endpoints followed by `Remove` for gone ones.
-async fn diff_loop<S: Send + 'static>(
-    mut watch: CacheWatch<EndpointsResource>,
+/// `healthy_endpoints()` against the desired set. Added endpoints start a
+/// concurrent connection attempt (retrying with backoff until the address is
+/// removed); `Change::Insert` is emitted only once the connection is actually
+/// established, so the balancer never routes requests to an unconnected
+/// endpoint. Removed endpoints cancel any in-flight attempt and emit
+/// `Change::Remove` if they had been inserted.
+async fn diff_loop<S: Send + 'static, W>(
+    watch_factory: W,
     connector: ConnectorSwap<S>,
     tx: mpsc::Sender<Result<Change<EndpointAddress, S>, BoxError>>,
-) {
-    let mut active: HashSet<EndpointAddress> = HashSet::new();
+) where
+    W: Fn() -> CacheWatch<EndpointsResource> + Send + 'static,
+{
+    let mut watch = watch_factory();
+    // Endpoints in the latest snapshot.
+    let mut desired: HashSet<EndpointAddress> = HashSet::new();
+    // Endpoints whose `Insert` has been sent to the balancer.
+    let mut inserted: HashSet<EndpointAddress> = HashSet::new();
+    // In-flight connection attempts, cancellable by address.
+    let mut connecting: KeyedFutures<EndpointAddress, S> = KeyedFutures::new();
 
-    while let Some(endpoints) = watch.next().await {
-        let new_set: HashSet<EndpointAddress> = endpoints
-            .healthy_endpoints()
-            .map(|ep| ep.address.clone())
-            .collect();
+    loop {
+        tokio::select! {
+            snapshot = watch.next() => {
+                let Some(endpoints) = snapshot else {
+                    // Cache entry removed: the cluster left the config.
+                    // Drain the balancer and re-subscribe — the same name
+                    // may return (e.g. the next canary rollout), and this
+                    // stream must outlive the removal because the cluster
+                    // client registry caches clients by name.
+                    for addr in std::mem::take(&mut desired) {
+                        let _ = connecting.cancel(&addr);
+                        if inserted.remove(&addr)
+                            && tx.send(Ok(Change::Remove(addr))).await.is_err()
+                        {
+                            return;
+                        }
+                    }
+                    watch = watch_factory();
+                    continue;
+                };
+                let new_set: HashSet<EndpointAddress> = endpoints
+                    .healthy_endpoints()
+                    .map(|ep| ep.address.clone())
+                    .collect();
 
-        for added in new_set.difference(&active) {
-            let svc = connector.load_full().connect(added).await;
-            if tx
-                .send(Ok(Change::Insert(added.clone(), svc)))
-                .await
-                .is_err()
-            {
-                return;
+                for added in new_set.difference(&desired) {
+                    let _ = connecting.add(
+                        added.clone(),
+                        connect_with_backoff(connector.clone(), added.clone()),
+                    );
+                }
+                for removed in desired.difference(&new_set) {
+                    let _ = connecting.cancel(removed);
+                    if inserted.remove(removed)
+                        && tx.send(Ok(Change::Remove(removed.clone()))).await.is_err()
+                    {
+                        return;
+                    }
+                }
+                desired = new_set;
+            }
+            (addr, svc) = poll_fn(|cx| match connecting.poll_next(cx) {
+                Poll::Ready(Some(item)) => Poll::Ready(item),
+                // `None` means no attempts in flight; wait for snapshots.
+                Poll::Ready(None) | Poll::Pending => Poll::Pending,
+            }) => {
+                if desired.contains(&addr) {
+                    inserted.insert(addr.clone());
+                    if tx.send(Ok(Change::Insert(addr, svc))).await.is_err() {
+                        return;
+                    }
+                }
             }
         }
+    }
+}
 
-        for removed in active.difference(&new_set) {
-            if tx.send(Ok(Change::Remove(removed.clone()))).await.is_err() {
-                return;
+/// Connects to `addr`, retrying with exponential backoff until it succeeds.
+///
+/// The connector is re-read from the swap on every attempt so CDS updates
+/// (e.g. rotated TLS config) apply to retries. Resolves only on success;
+/// abandoning the future (via [`KeyedFutures::cancel`]) aborts the attempt.
+async fn connect_with_backoff<S: Send + 'static>(
+    connector: ConnectorSwap<S>,
+    addr: EndpointAddress,
+) -> S {
+    let mut backoff = CONNECT_BACKOFF_INITIAL;
+    loop {
+        match connector.load_full().connect(&addr).await {
+            Ok(svc) => return svc,
+            Err(error) => {
+                tracing::warn!(
+                    address = %addr,
+                    error = %error,
+                    backoff_secs = backoff.as_secs(),
+                    "endpoint connect failed; retrying",
+                );
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(CONNECT_BACKOFF_MAX);
             }
         }
-
-        active = new_set;
     }
 }
 
@@ -146,9 +224,9 @@ mod tests {
 
     impl Connector for StringConnector {
         type Service = String;
-        fn connect(&self, addr: &EndpointAddress) -> BoxFuture<Self::Service> {
+        fn connect(&self, addr: &EndpointAddress) -> BoxFuture<Result<Self::Service, BoxError>> {
             let s = addr.to_string();
-            Box::pin(async move { s })
+            Box::pin(async move { Ok(s) })
         }
     }
 
@@ -178,7 +256,7 @@ mod tests {
 
     #[tokio::test]
     async fn initial_endpoints_emitted_as_inserts() {
-        let cache = XdsCache::new();
+        let cache = Arc::new(XdsCache::new());
         let manager = EndpointManager::new(test_swap());
 
         cache.update_endpoints(
@@ -186,7 +264,10 @@ mod tests {
             make_endpoints("c1", &[("10.0.0.1", 8080), ("10.0.0.2", 8080)]),
         );
 
-        let mut stream = manager.discover_endpoints(cache.watch_endpoints("c1"));
+        let mut stream = manager.discover_endpoints({
+            let cache = cache.clone();
+            move || cache.watch_endpoints("c1")
+        });
 
         let mut addrs: Vec<String> = Vec::new();
         for _ in 0..2 {
@@ -201,12 +282,15 @@ mod tests {
 
     #[tokio::test]
     async fn added_endpoint_emits_insert() {
-        let cache = XdsCache::new();
+        let cache = Arc::new(XdsCache::new());
         let manager = EndpointManager::new(test_swap());
 
         cache.update_endpoints("c1", make_endpoints("c1", &[("10.0.0.1", 8080)]));
 
-        let mut stream = manager.discover_endpoints(cache.watch_endpoints("c1"));
+        let mut stream = manager.discover_endpoints({
+            let cache = cache.clone();
+            move || cache.watch_endpoints("c1")
+        });
         let _ = stream.next().await; // consume initial
 
         cache.update_endpoints(
@@ -222,7 +306,7 @@ mod tests {
 
     #[tokio::test]
     async fn removed_endpoint_emits_remove() {
-        let cache = XdsCache::new();
+        let cache = Arc::new(XdsCache::new());
         let manager = EndpointManager::new(test_swap());
 
         cache.update_endpoints(
@@ -230,7 +314,10 @@ mod tests {
             make_endpoints("c1", &[("10.0.0.1", 8080), ("10.0.0.2", 8080)]),
         );
 
-        let mut stream = manager.discover_endpoints(cache.watch_endpoints("c1"));
+        let mut stream = manager.discover_endpoints({
+            let cache = cache.clone();
+            move || cache.watch_endpoints("c1")
+        });
         // Consume 2 initial inserts.
         let _ = stream.next().await;
         let _ = stream.next().await;
@@ -246,12 +333,15 @@ mod tests {
 
     #[tokio::test]
     async fn unhealthy_endpoint_removed() {
-        let cache = XdsCache::new();
+        let cache = Arc::new(XdsCache::new());
         let manager = EndpointManager::new(test_swap());
 
         cache.update_endpoints("c1", make_endpoints("c1", &[("10.0.0.1", 8080)]));
 
-        let mut stream = manager.discover_endpoints(cache.watch_endpoints("c1"));
+        let mut stream = manager.discover_endpoints({
+            let cache = cache.clone();
+            move || cache.watch_endpoints("c1")
+        });
         let _ = stream.next().await; // consume initial insert
 
         let unhealthy = Arc::new(EndpointsResource {
@@ -276,30 +366,50 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cache_removal_closes_stream() {
-        let cache = XdsCache::new();
+    async fn cache_removal_drains_and_survives_readdition() {
+        let cache = Arc::new(XdsCache::new());
         let manager = EndpointManager::new(test_swap());
 
         cache.update_endpoints("c1", make_endpoints("c1", &[("10.0.0.1", 8080)]));
 
-        let mut stream = manager.discover_endpoints(cache.watch_endpoints("c1"));
-        let _ = stream.next().await; // consume initial
+        let mut stream = manager.discover_endpoints({
+            let cache = cache.clone();
+            move || cache.watch_endpoints("c1")
+        });
+        let _ = stream.next().await; // consume initial Insert
 
+        // Removal drains the balancer but does not end the stream: the
+        // cluster name may return (registry clients live forever).
         cache.remove_endpoints("c1");
+        match stream.next().await.unwrap().unwrap() {
+            Change::Remove(addr) => assert_eq!(addr.to_string(), "10.0.0.1:8080"),
+            Change::Insert(..) => panic!("expected Remove"),
+        }
 
-        assert!(stream.next().await.is_none());
+        // Re-addition under the same name resolves fresh endpoints.
+        cache.update_endpoints("c1", make_endpoints("c1", &[("10.0.0.2", 9090)]));
+        match stream.next().await.unwrap().unwrap() {
+            Change::Insert(addr, _) => assert_eq!(addr.to_string(), "10.0.0.2:9090"),
+            Change::Remove(_) => panic!("expected Insert"),
+        }
     }
 
     #[tokio::test]
     async fn multiple_clusters_independent() {
-        let cache = XdsCache::new();
+        let cache = Arc::new(XdsCache::new());
         let manager = EndpointManager::new(test_swap());
 
         cache.update_endpoints("c1", make_endpoints("c1", &[("10.0.0.1", 8080)]));
         cache.update_endpoints("c2", make_endpoints("c2", &[("10.0.0.2", 9090)]));
 
-        let mut s1 = manager.discover_endpoints(cache.watch_endpoints("c1"));
-        let mut s2 = manager.discover_endpoints(cache.watch_endpoints("c2"));
+        let mut s1 = manager.discover_endpoints({
+            let cache = cache.clone();
+            move || cache.watch_endpoints("c1")
+        });
+        let mut s2 = manager.discover_endpoints({
+            let cache = cache.clone();
+            move || cache.watch_endpoints("c2")
+        });
 
         match s1.next().await.unwrap().unwrap() {
             Change::Insert(addr, _) => assert_eq!(addr.to_string(), "10.0.0.1:8080"),
@@ -313,12 +423,15 @@ mod tests {
 
     #[tokio::test]
     async fn endpoint_swap_emits_insert_then_remove() {
-        let cache = XdsCache::new();
+        let cache = Arc::new(XdsCache::new());
         let manager = EndpointManager::new(test_swap());
 
         cache.update_endpoints("c1", make_endpoints("c1", &[("10.0.0.1", 8080)]));
 
-        let mut stream = manager.discover_endpoints(cache.watch_endpoints("c1"));
+        let mut stream = manager.discover_endpoints({
+            let cache = cache.clone();
+            move || cache.watch_endpoints("c1")
+        });
         let _ = stream.next().await; // consume initial
 
         cache.update_endpoints("c1", make_endpoints("c1", &[("10.0.0.2", 8080)]));

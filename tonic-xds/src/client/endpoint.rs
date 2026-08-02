@@ -186,12 +186,23 @@ impl<S> Load for EndpointChannel<S> {
     }
 }
 
+/// Initial retry backoff after a failed endpoint connection attempt.
+pub(crate) const CONNECT_BACKOFF_INITIAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Maximum retry backoff between endpoint connection attempts.
+pub(crate) const CONNECT_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Factory for creating connections to endpoints.
 ///
 /// Implementations capture cluster-level config (TLS, HTTP/2 settings, timeouts)
-/// at construction time. The implementation handles retries and concurrency
-/// internally — the returned future resolves when a connection is established
-/// (or is cancelled by dropping).
+/// at construction time. The returned future resolves once the transport is
+/// actually connected, or fails with the connection error. Implementations
+/// must not resolve with a lazily-connecting service: the balancer routes
+/// traffic to any service it is handed, so readiness gating relies on this
+/// contract (a lazily-connected channel to an unreachable address accepts
+/// and queues requests instead of failing them).
+///
+/// One attempt per call — retry policy belongs to the caller.
 pub trait Connector {
     /// The service type produced by this connector.
     type Service;
@@ -200,7 +211,7 @@ pub trait Connector {
     fn connect(
         &self,
         addr: &EndpointAddress,
-    ) -> crate::common::async_util::BoxFuture<Self::Service>;
+    ) -> crate::common::async_util::BoxFuture<Result<Self::Service, tower::BoxError>>;
 }
 
 /// A read-only view of a cluster's parsed xDS configuration, handed to

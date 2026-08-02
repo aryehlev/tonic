@@ -54,6 +54,7 @@ pub struct XdsChannelConfig {
     target_uri: XdsUri,
     bootstrap: Option<BootstrapConfig>,
     call_creds: Option<Arc<dyn TonicCallCredentials>>,
+    request_timeout: Option<std::time::Duration>,
 }
 
 impl XdsChannelConfig {
@@ -64,7 +65,20 @@ impl XdsChannelConfig {
             target_uri,
             bootstrap: None,
             call_creds: None,
+            request_timeout: None,
         }
+    }
+
+    /// Applies a client-side deadline to every request on the channel,
+    /// covering routing, load balancing, and the transport — the xDS
+    /// equivalent of `tonic::transport::Endpoint::timeout`.
+    ///
+    /// Unset by default: a request with no caller-imposed deadline can then
+    /// wait indefinitely (e.g. parked on a cluster with no ready endpoints).
+    #[must_use]
+    pub fn with_request_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.request_timeout = Some(timeout);
+        self
     }
 
     /// Sets the bootstrap configuration.
@@ -397,11 +411,17 @@ impl XdsChannelBuilder {
             })
             .service(lb_service);
 
-        BoxCloneSyncService::new(XdsChannel {
+        let channel = XdsChannel {
             config: self.config.clone(),
             inner,
             _resources: Some(resources),
-        })
+        };
+        match self.config.request_timeout {
+            Some(timeout) => {
+                BoxCloneSyncService::new(tower::timeout::Timeout::new(channel, timeout))
+            }
+            None => BoxCloneSyncService::new(channel),
+        }
     }
 
     /// Builds an `XdsChannelGrpc`, which is a type-erased gRPC channel.

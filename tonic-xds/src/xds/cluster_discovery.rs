@@ -75,14 +75,12 @@ const ENDPOINT_KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Apply connection-liveness settings to a per-endpoint `Endpoint`.
 ///
-/// Endpoint channels are created with `connect_lazy`, so a tonic `Channel`
-/// reports readiness independently of TCP connectivity. Without these
-/// settings a request routed to a black-holed address (e.g. a deleted pod IP,
-/// which Kubernetes drops without a RST) hangs on unanswered SYNs, and an
-/// established connection to a dead peer is never torn down — either way the
-/// endpoint stays "ready" to the LB and requests only die by the caller's
-/// deadline. The connect timeout and keepalives turn both cases into prompt
-/// transport errors instead.
+/// Endpoint channels are connected eagerly (see [`Connector`]), so the
+/// connect timeout bounds how long an unreachable address (e.g. a deleted
+/// pod IP, which Kubernetes drops without a RST) stays in the connecting
+/// state before the attempt fails and is retried with backoff. The HTTP/2
+/// keepalives tear down established connections whose peer has silently
+/// died, so the balancer's error feedback stays prompt.
 fn with_liveness_settings(endpoint: Endpoint) -> Endpoint {
     endpoint
         .connect_timeout(ENDPOINT_CONNECT_TIMEOUT)
@@ -125,7 +123,10 @@ impl<MC: MakeConnector> ClusterDiscovery<EndpointAddress, MC::Service> for XdsCl
 
             let connector_swap: ConnectorSwap<MC::Service> = loop {
                 let Some(cluster) = cluster_watch.next().await else {
-                    return;
+                    // Entry removed before the first config; re-subscribe and
+                    // wait for the cluster name to (re)appear.
+                    cluster_watch = cache.watch_cluster(&cluster_name);
+                    continue;
                 };
                 match make_connector.make_connector(ClusterConfig::from_resource(&cluster)) {
                     Ok(c) => break Arc::new(ArcSwap::from_pointee(c)),
@@ -138,7 +139,11 @@ impl<MC: MakeConnector> ClusterDiscovery<EndpointAddress, MC::Service> for XdsCl
             };
 
             let manager = EndpointManager::new(Arc::clone(&connector_swap));
-            let mut endpoints = manager.discover_endpoints(cache.watch_endpoints(&cluster_name));
+            let mut endpoints = manager.discover_endpoints({
+                let cache = cache.clone();
+                let cluster_name = cluster_name.clone();
+                move || cache.watch_endpoints(&cluster_name)
+            });
 
             loop {
                 tokio::select! {
@@ -147,16 +152,23 @@ impl<MC: MakeConnector> ClusterDiscovery<EndpointAddress, MC::Service> for XdsCl
                             return;
                         }
                     }
-                    Some(cluster) = cluster_watch.next() => {
-                        match make_connector.make_connector(ClusterConfig::from_resource(&cluster)) {
-                            Ok(new) => connector_swap.store(Arc::new(new)),
-                            Err(e) => tracing::warn!(
-                                cluster = %cluster_name,
-                                error = %e,
-                                "CDS update rejected; keeping previous connector",
-                            ),
+                    cluster = cluster_watch.next() => match cluster {
+                        Some(cluster) => {
+                            match make_connector
+                                .make_connector(ClusterConfig::from_resource(&cluster))
+                            {
+                                Ok(new) => connector_swap.store(Arc::new(new)),
+                                Err(e) => tracing::warn!(
+                                    cluster = %cluster_name,
+                                    error = %e,
+                                    "CDS update rejected; keeping previous connector",
+                                ),
+                            }
                         }
-                    }
+                        // Cluster removed; keep the discovery alive for its
+                        // possible return under the same name.
+                        None => cluster_watch = cache.watch_cluster(&cluster_name),
+                    },
                     else => return,
                 }
             }
@@ -250,22 +262,27 @@ pub(crate) enum TlsConnectorBuildError {
     UnknownIdentityInstance(String),
 }
 
-/// Plaintext (non-TLS) [`Connector`] that produces a lazily-connected
-/// `tonic::Channel` for each endpoint.
+/// Plaintext (non-TLS) [`Connector`] that eagerly connects a
+/// `tonic::Channel` to each endpoint.
 pub(crate) struct PlaintextConnector;
 
 impl Connector for PlaintextConnector {
     type Service = EndpointChannel<Channel>;
 
-    fn connect(&self, addr: &EndpointAddress) -> BoxFuture<Self::Service> {
+    fn connect(&self, addr: &EndpointAddress) -> BoxFuture<Result<Self::Service, BoxError>> {
         // EndpointAddress only holds validated Ipv4/Ipv6/Hostname + u16 port,
         // and its Display impl produces "ip:port" or "hostname:port". Prefixing
         // with "http://" always yields a valid URI, so from_shared cannot fail.
         let endpoint = Endpoint::from_shared(format!("http://{addr}"))
             .expect("EndpointAddress Display guarantees valid URI");
-        let channel = with_liveness_settings(endpoint).connect_lazy();
-        let svc = EndpointChannel::new(channel);
-        Box::pin(async move { svc })
+        Box::pin(async move {
+            // Eager connect (never `connect_lazy`): the future resolves only
+            // once the TCP + HTTP/2 handshake succeeds, bounded by the
+            // endpoint's connect timeout, so unreachable endpoints are never
+            // handed to the balancer.
+            let channel = with_liveness_settings(endpoint).connect().await?;
+            Ok(EndpointChannel::new(channel))
+        })
     }
 }
 
@@ -326,7 +343,7 @@ impl TlsConnector {
 impl Connector for TlsConnector {
     type Service = EndpointChannel<Channel>;
 
-    fn connect(&self, addr: &EndpointAddress) -> BoxFuture<Self::Service> {
+    fn connect(&self, addr: &EndpointAddress) -> BoxFuture<Result<Self::Service, BoxError>> {
         use rustls::client::danger::ServerCertVerifier;
 
         let verifier: Arc<dyn ServerCertVerifier> = self.verifier.clone();
@@ -361,26 +378,15 @@ impl Connector for TlsConnector {
                 .expect("EndpointAddress Display guarantees valid URI"),
         );
 
-        let channel = match endpoint.tls_config_with_verifier(tls_config, verifier) {
-            Ok(ep) => ep.connect_lazy(),
-            Err(e) => {
-                // tls_config_with_verifier only errors on UDS endpoints
-                // (see tonic's endpoint.rs), which we never construct. The
-                // defensive fallback returns a non-TLS lazy channel — the
-                // request will fail at the wire, surfacing the misconfig.
-                tracing::error!(
-                    error = %e, address = %addr,
-                    "tls_config_with_verifier failed; non-TLS lazy fallback",
-                );
-                with_liveness_settings(
-                    Endpoint::from_shared(uri)
-                        .expect("EndpointAddress Display guarantees valid URI"),
-                )
-                .connect_lazy()
-            }
-        };
-        let svc = EndpointChannel::new(channel);
-        Box::pin(async move { svc })
+        Box::pin(async move {
+            // tls_config_with_verifier only errors on UDS endpoints (see
+            // tonic's endpoint.rs), which we never construct; surfacing the
+            // error keeps the endpoint out of the balancer instead of
+            // poisoning it with a plaintext fallback.
+            let ep = endpoint.tls_config_with_verifier(tls_config, verifier)?;
+            let channel = ep.connect().await?;
+            Ok(EndpointChannel::new(channel))
+        })
     }
 }
 

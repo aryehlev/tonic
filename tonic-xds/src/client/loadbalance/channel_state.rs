@@ -58,9 +58,10 @@ use pin_project_lite::pin_project;
 use tower::Service;
 use tower::load::Load;
 
-use crate::client::endpoint::{Connector, EndpointAddress};
+use crate::client::endpoint::{
+    CONNECT_BACKOFF_INITIAL, CONNECT_BACKOFF_MAX, Connector, EndpointAddress,
+};
 use crate::client::loadbalance::outlier_detection::OutlierStatsRegistry;
-use crate::common::async_util::BoxFuture;
 
 // ---------------------------------------------------------------------------
 // EndpointCounters / OutlierChannelState
@@ -269,15 +270,16 @@ impl IdleChannel {
     /// `Arc<OutlierChannelState>` from `registry.add_channel(addr)` —
     /// idempotent, so a re-discovered or reconnected address keeps
     /// its existing counters and ejection state.
-    pub(crate) fn connect<C: Connector>(
+    pub(crate) fn connect<C>(
         self,
         connector: Arc<C>,
         registry: Arc<OutlierStatsRegistry>,
     ) -> ConnectingChannel<C::Service>
     where
+        C: Connector + Send + Sync + ?Sized + 'static,
         C::Service: Send + 'static,
     {
-        ConnectingChannel::new(connector.connect(&self.addr), self.addr, registry)
+        ConnectingChannel::new(connector, self.addr, registry)
     }
 }
 
@@ -287,10 +289,11 @@ impl IdleChannel {
 
 /// A channel that is in the process of connecting.
 ///
-/// `impl Future<Output = ReadyChannel<S>>` — the connector's
-/// service-future is wrapped at construction time into an async
-/// block that looks up the per-channel outlier state from `registry`
-/// (via `add_channel`) and produces a fully-formed `ReadyChannel`.
+/// `impl Future<Output = ReadyChannel<S>>` — resolves once a connection is
+/// actually established. Failed attempts are retried with exponential
+/// backoff, so the future only completes on success; an endpoint that never
+/// connects simply never becomes ready. The resolved channel carries the
+/// per-channel outlier state from `registry` (via `add_channel`).
 /// Cancellation is handled externally via [`KeyedFutures::cancel`].
 ///
 /// [`KeyedFutures::cancel`]: crate::client::loadbalance::keyed_futures::KeyedFutures::cancel
@@ -299,14 +302,37 @@ pub(crate) struct ConnectingChannel<S> {
 }
 
 impl<S: Send + 'static> ConnectingChannel<S> {
-    pub(crate) fn new(
-        fut: BoxFuture<S>,
+    pub(crate) fn new<C>(
+        connector: Arc<C>,
         addr: EndpointAddress,
         registry: Arc<OutlierStatsRegistry>,
-    ) -> Self {
+    ) -> Self
+    where
+        C: Connector<Service = S> + Send + Sync + ?Sized + 'static,
+    {
+        // The first attempt starts immediately (entering the Connecting
+        // state means a connection attempt is in flight); retries are
+        // created lazily inside the loop.
+        let mut attempt = connector.connect(&addr);
         Self {
             inner: Box::pin(async move {
-                let svc = fut.await;
+                let mut backoff = CONNECT_BACKOFF_INITIAL;
+                let svc = loop {
+                    match attempt.await {
+                        Ok(svc) => break svc,
+                        Err(error) => {
+                            tracing::warn!(
+                                address = %addr,
+                                error = %error,
+                                backoff_secs = backoff.as_secs(),
+                                "endpoint connect failed; retrying",
+                            );
+                            tokio::time::sleep(backoff).await;
+                            backoff = (backoff * 2).min(CONNECT_BACKOFF_MAX);
+                            attempt = connector.connect(&addr);
+                        }
+                    }
+                };
                 let outlier = registry.add_channel(addr.clone());
                 ReadyChannel::new(addr, svc, outlier)
             }),
@@ -387,15 +413,16 @@ impl<S> ReadyChannel<S> {
     /// Drop the connection and start a fresh connect for the same
     /// address. The outlier state is re-attached from `registry`
     /// when the new connect resolves.
-    pub(crate) fn reconnect<C: Connector<Service = S>>(
+    pub(crate) fn reconnect<C>(
         self,
         connector: Arc<C>,
         registry: Arc<OutlierStatsRegistry>,
     ) -> ConnectingChannel<S>
     where
+        C: Connector<Service = S> + Send + Sync + ?Sized + 'static,
         S: Send + 'static,
     {
-        ConnectingChannel::new(connector.connect(&self.addr), self.addr, registry)
+        ConnectingChannel::new(connector, self.addr, registry)
     }
 }
 
@@ -456,9 +483,11 @@ impl<S: Clone + Send + 'static> Future for EjectedChannel<S> {
         match this.ejection_timer.poll(cx) {
             Poll::Ready(()) => {
                 if this.config.needs_reconnect {
-                    let fut = this.connector.connect(this.addr);
-                    let connecting =
-                        ConnectingChannel::new(fut, this.addr.clone(), this.registry.clone());
+                    let connecting = ConnectingChannel::new(
+                        this.connector.clone(),
+                        this.addr.clone(),
+                        this.registry.clone(),
+                    );
                     Poll::Ready(UnejectedChannel::Connecting(connecting))
                 } else {
                     let ready = ReadyChannel::new(
@@ -478,9 +507,12 @@ impl<S: Clone + Send + 'static> Future for EjectedChannel<S> {
 mod tests {
     use super::*;
     use crate::client::loadbalance::keyed_futures::KeyedFutures;
+    use crate::common::async_util::BoxFuture;
     use futures_util::task::noop_waker;
     use std::future;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicU32, Ordering};
+    use tower::BoxError;
 
     #[derive(Clone, Debug)]
     struct MockService;
@@ -511,12 +543,37 @@ mod tests {
         }
     }
 
+    /// Connector that yields a caller-supplied future on first `connect`.
+    struct OneshotConnector {
+        fut: Mutex<Option<BoxFuture<Result<MockService, BoxError>>>>,
+    }
+
+    impl OneshotConnector {
+        fn new(fut: BoxFuture<Result<MockService, BoxError>>) -> Arc<Self> {
+            Arc::new(Self {
+                fut: Mutex::new(Some(fut)),
+            })
+        }
+    }
+
+    impl Connector for OneshotConnector {
+        type Service = MockService;
+
+        fn connect(&self, _addr: &EndpointAddress) -> BoxFuture<Result<Self::Service, BoxError>> {
+            self.fut
+                .lock()
+                .unwrap()
+                .take()
+                .expect("OneshotConnector::connect called more than once")
+        }
+    }
+
     impl Connector for MockConnector {
         type Service = MockService;
 
-        fn connect(&self, _addr: &EndpointAddress) -> BoxFuture<Self::Service> {
+        fn connect(&self, _addr: &EndpointAddress) -> BoxFuture<Result<Self::Service, BoxError>> {
             self.connect_count.fetch_add(1, Ordering::SeqCst);
-            Box::pin(future::ready(MockService))
+            Box::pin(future::ready(Ok(MockService)))
         }
     }
 
@@ -582,7 +639,7 @@ mod tests {
     async fn test_connecting_in_keyed_futures() {
         let (tx, rx) = tokio::sync::oneshot::channel::<MockService>();
         let connecting = ConnectingChannel::new(
-            Box::pin(async move { rx.await.unwrap() }),
+            OneshotConnector::new(Box::pin(async move { Ok(rx.await.unwrap()) })),
             test_addr(),
             test_registry(),
         );
@@ -603,7 +660,7 @@ mod tests {
     #[tokio::test]
     async fn test_connecting_cancelled_via_keyed_futures() {
         let connecting = ConnectingChannel::new(
-            Box::pin(future::pending::<MockService>()),
+            OneshotConnector::new(Box::pin(future::pending::<Result<MockService, BoxError>>())),
             test_addr(),
             test_registry(),
         );
