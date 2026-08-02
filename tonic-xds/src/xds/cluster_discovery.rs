@@ -122,7 +122,12 @@ impl<MC: MakeConnector> ClusterDiscovery<EndpointAddress, MC::Service> for XdsCl
             let mut cluster_watch = cache.watch_cluster(&cluster_name);
 
             let connector_swap: ConnectorSwap<MC::Service> = loop {
-                let Some(cluster) = cluster_watch.next().await else {
+                let next = tokio::select! {
+                    next = cluster_watch.next() => next,
+                    // Consumer dropped while waiting for config: reap.
+                    _ = tx.closed() => return,
+                };
+                let Some(cluster) = next else {
                     // Entry removed before the first config; re-subscribe and
                     // wait for the cluster name to (re)appear.
                     cluster_watch = cache.watch_cluster(&cluster_name);
@@ -147,6 +152,9 @@ impl<MC: MakeConnector> ClusterDiscovery<EndpointAddress, MC::Service> for XdsCl
 
             loop {
                 tokio::select! {
+                    // The consumer (cluster client) was dropped: reap this
+                    // task; dropping `endpoints` reaps the diff loop in turn.
+                    _ = tx.closed() => return,
                     Some(change) = endpoints.next() => {
                         if tx.send(change).await.is_err() {
                             return;

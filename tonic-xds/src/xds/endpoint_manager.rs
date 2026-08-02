@@ -128,6 +128,8 @@ async fn diff_loop<S: Send + 'static, W>(
 
     loop {
         tokio::select! {
+            // The consumer (cluster client) was dropped: reap this task.
+            _ = tx.closed() => return,
             snapshot = watch.next() => {
                 let Some(endpoints) = snapshot else {
                     // Cache entry removed: the cluster left the config.

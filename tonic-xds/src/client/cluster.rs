@@ -253,6 +253,15 @@ where
             })
             .clone()
     }
+
+    /// Removes the client for a cluster that left the configuration.
+    ///
+    /// In-flight requests keep their clones alive until they complete; the
+    /// cluster's discovery tasks exit once the last clone drops (they watch
+    /// their change-channel's `closed()`).
+    pub(crate) fn remove(&self, key: &str) {
+        self.registry.remove(key);
+    }
 }
 
 impl<Req, Resp> Default for ClusterClientRegistry<Req, Resp>

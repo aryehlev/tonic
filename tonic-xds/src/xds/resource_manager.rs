@@ -84,8 +84,13 @@ impl XdsResourceManager {
     /// * `xds_client` - The xDS client for creating resource watches
     /// * `cache` - The shared cache to write resources into
     /// * `listener_name` - The LDS resource name to watch (from target URI)
-    pub(crate) fn new(xds_client: XdsClient, cache: Arc<XdsCache>, listener_name: String) -> Self {
-        let state = CascadeState::new();
+    pub(crate) fn new(
+        xds_client: XdsClient,
+        cache: Arc<XdsCache>,
+        listener_name: String,
+        on_cluster_removed: OnClusterRemoved,
+    ) -> Self {
+        let state = CascadeState::new(on_cluster_removed);
         let handle = tokio::spawn(state.run(xds_client, cache, listener_name));
         Self {
             _task: AbortOnDrop(handle),
@@ -96,6 +101,11 @@ impl XdsResourceManager {
 /// Mutable state for the entire LDS -> RDS -> CDS -> EDS cascade.
 ///
 /// All four resource levels are polled in a single task via [`run`](Self::run).
+/// Callback invoked when a cluster leaves the route configuration, so the
+/// per-cluster client (and its discovery tasks) can be released instead of
+/// accumulating for every cluster name ever routed to.
+pub(crate) type OnClusterRemoved = Arc<dyn Fn(&str) + Send + Sync>;
+
 struct CascadeState {
     /// Active RDS watcher — `None` if the listener uses inline routes.
     rds_watcher: Option<ResourceWatcher<RouteConfigResource>>,
@@ -107,16 +117,19 @@ struct CascadeState {
     eds_watchers: StreamMap<String, WatcherStream<EndpointsResource>>,
     /// Current EDS service name per cluster, to detect when the name changes.
     eds_names: HashMap<String, String>,
+    /// Invoked for clusters removed by [`reconcile_clusters`](Self::reconcile_clusters).
+    on_cluster_removed: OnClusterRemoved,
 }
 
 impl CascadeState {
-    fn new() -> Self {
+    fn new(on_cluster_removed: OnClusterRemoved) -> Self {
         Self {
             rds_watcher: None,
             rds_name: None,
             cds_watchers: StreamMap::new(),
             eds_watchers: StreamMap::new(),
             eds_names: HashMap::new(),
+            on_cluster_removed,
         }
     }
 
@@ -299,6 +312,7 @@ impl CascadeState {
             self.eds_names.remove(name);
             cache.remove_cluster(name);
             cache.remove_endpoints(name);
+            (self.on_cluster_removed)(name);
         }
 
         for name in new_clusters.difference(&old_clusters) {
@@ -406,7 +420,7 @@ mod tests {
     async fn reconcile_adds_new_clusters() {
         let cache = test_cache();
         let client = test_client();
-        let mut state = CascadeState::new();
+        let mut state = CascadeState::new(Arc::new(|_: &str| {}));
 
         let rc = make_route_config("rc", &["a", "b"]);
         state.reconcile_clusters(&rc, &client, &cache).await;
@@ -420,7 +434,7 @@ mod tests {
     async fn reconcile_removes_old_clusters() {
         let cache = test_cache();
         let client = test_client();
-        let mut state = CascadeState::new();
+        let mut state = CascadeState::new(Arc::new(|_: &str| {}));
 
         let rc1 = make_route_config("rc", &["a", "b"]);
         state.reconcile_clusters(&rc1, &client, &cache).await;
@@ -438,7 +452,7 @@ mod tests {
     async fn reconcile_to_empty_removes_all() {
         let cache = test_cache();
         let client = test_client();
-        let mut state = CascadeState::new();
+        let mut state = CascadeState::new(Arc::new(|_: &str| {}));
 
         let rc1 = make_route_config("rc", &["a"]);
         state.reconcile_clusters(&rc1, &client, &cache).await;
@@ -453,7 +467,7 @@ mod tests {
     async fn handle_rds_ok_updates_cache_and_reconciles() {
         let cache = test_cache();
         let client = test_client();
-        let mut state = CascadeState::new();
+        let mut state = CascadeState::new(Arc::new(|_: &str| {}));
 
         let rc = make_route_config("rc-1", &["cluster-a", "cluster-b"]);
         state.handle_rds(ok_event(rc), &client, &cache).await;
@@ -468,7 +482,7 @@ mod tests {
     async fn handle_rds_err_preserves_state() {
         let cache = test_cache();
         let client = test_client();
-        let mut state = CascadeState::new();
+        let mut state = CascadeState::new(Arc::new(|_: &str| {}));
 
         let rc = make_route_config("rc", &["c1"]);
         state.handle_rds(ok_event(rc), &client, &cache).await;
@@ -483,7 +497,7 @@ mod tests {
     async fn handle_rds_ambient_error_preserves_state() {
         let cache = test_cache();
         let client = test_client();
-        let mut state = CascadeState::new();
+        let mut state = CascadeState::new(Arc::new(|_: &str| {}));
 
         let rc = make_route_config("rc", &["c1"]);
         state.handle_rds(ok_event(rc), &client, &cache).await;
@@ -497,7 +511,7 @@ mod tests {
     async fn handle_lds_inline_writes_route_config() {
         let cache = test_cache();
         let client = test_client();
-        let mut state = CascadeState::new();
+        let mut state = CascadeState::new(Arc::new(|_: &str| {}));
 
         state
             .handle_lds(ok_event(make_listener_inline(&["c1"])), &client, &cache)
@@ -514,7 +528,7 @@ mod tests {
     async fn handle_lds_inline_clears_existing_rds() {
         let cache = test_cache();
         let client = test_client();
-        let mut state = CascadeState::new();
+        let mut state = CascadeState::new(Arc::new(|_: &str| {}));
 
         state
             .handle_lds(ok_event(make_listener_rds("rc-1")), &client, &cache)
@@ -533,7 +547,7 @@ mod tests {
     async fn handle_lds_rds_sets_watcher_and_name() {
         let cache = test_cache();
         let client = test_client();
-        let mut state = CascadeState::new();
+        let mut state = CascadeState::new(Arc::new(|_: &str| {}));
 
         state
             .handle_lds(ok_event(make_listener_rds("my-route")), &client, &cache)
@@ -547,7 +561,7 @@ mod tests {
     async fn handle_lds_rds_same_name_reuses_watcher() {
         let cache = test_cache();
         let client = test_client();
-        let mut state = CascadeState::new();
+        let mut state = CascadeState::new(Arc::new(|_: &str| {}));
 
         state
             .handle_lds(ok_event(make_listener_rds("rc")), &client, &cache)
@@ -566,7 +580,7 @@ mod tests {
     async fn handle_lds_rds_different_name_replaces_watcher() {
         let cache = test_cache();
         let client = test_client();
-        let mut state = CascadeState::new();
+        let mut state = CascadeState::new(Arc::new(|_: &str| {}));
 
         state
             .handle_lds(ok_event(make_listener_rds("rc-1")), &client, &cache)
@@ -583,7 +597,7 @@ mod tests {
     async fn handle_lds_err_preserves_state() {
         let cache = test_cache();
         let client = test_client();
-        let mut state = CascadeState::new();
+        let mut state = CascadeState::new(Arc::new(|_: &str| {}));
 
         state
             .handle_lds(ok_event(make_listener_inline(&["c1"])), &client, &cache)
@@ -606,7 +620,7 @@ mod tests {
     async fn handle_lds_ambient_error_preserves_state() {
         let cache = test_cache();
         let client = test_client();
-        let mut state = CascadeState::new();
+        let mut state = CascadeState::new(Arc::new(|_: &str| {}));
 
         state
             .handle_lds(ok_event(make_listener_rds("rc")), &client, &cache)
@@ -672,7 +686,7 @@ mod tests {
             .expect("watcher closed");
 
         let cache = test_cache();
-        let mut state = CascadeState::new();
+        let mut state = CascadeState::new(Arc::new(|_: &str| {}));
         tokio::time::timeout(
             Duration::from_secs(10),
             state.handle_rds(event, &xds_client, &cache),
