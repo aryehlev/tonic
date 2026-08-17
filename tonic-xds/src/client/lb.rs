@@ -59,11 +59,11 @@ pub(crate) enum LoadBalancingError {
 /// chosen by the routing layer.
 ///
 /// This is a pure lookup: cluster clients are created and destroyed only by
-/// the route-config reconcile (via `ClusterClientRegistry::sync_clusters`),
-/// never by the request path. A request whose decision names a cluster with
-/// no client — e.g. one that left the route config after the decision was
-/// made — fails fast instead of waiting on a cluster that will never be
-/// ready.
+/// the route-config reconcile (via `ClusterClientRegistry::add_clusters` /
+/// `evict_clusters`), never by the request path. A request whose decision
+/// names a cluster with no client — e.g. one that left the route config
+/// after the decision was made — fails fast with UNAVAILABLE instead of
+/// waiting on a cluster that will never be ready.
 pub(crate) struct XdsLbService<Req, Resp>
 where
     Req: Send + 'static,
@@ -119,8 +119,15 @@ where
 
         let Some(cluster_client) = self.cluster_registry.get_cluster(&routing_decision.cluster)
         else {
+            // A `tonic::Status` (not the bare enum, which tonic would map to
+            // Unknown): the miss is a transient race with a config update
+            // removing the cluster, and UNAVAILABLE is the code callers and
+            // retry policies key on for such conditions.
             return Box::pin(async move {
-                Err(LoadBalancingError::ClusterNotFound(routing_decision.cluster).into())
+                Err(tonic::Status::unavailable(
+                    LoadBalancingError::ClusterNotFound(routing_decision.cluster).to_string(),
+                )
+                .into())
             });
         };
 

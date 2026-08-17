@@ -22,7 +22,7 @@
  *
  */
 
-use crate::client::cluster::ClusterClientRegistryGrpc;
+use crate::client::cluster::{ClusterClientRegistryGrpc, RegistryClusterSync};
 use crate::client::endpoint::{EndpointAddress, EndpointChannel};
 use crate::client::lb::{ClusterDiscovery, XdsLbService};
 use crate::client::route::{PreRouteInterceptor, Router, XdsRoutingLayer};
@@ -345,35 +345,25 @@ impl XdsChannelBuilder {
         let cache = Arc::new(XdsCache::new());
 
         #[cfg(feature = "_tls-any")]
-        let discovery: Arc<
-            dyn ClusterDiscovery<EndpointAddress, EndpointChannel<Channel>>,
-        > = Arc::new(XdsClusterDiscovery::new(
-            cache.clone(),
-            GrpcMakeConnector::new(cert_provider_registry),
-        ));
+        let make_connector = GrpcMakeConnector::new(cert_provider_registry);
         #[cfg(not(feature = "_tls-any"))]
-        let discovery: Arc<
-            dyn ClusterDiscovery<EndpointAddress, EndpointChannel<Channel>>,
-        > = Arc::new(XdsClusterDiscovery::new(
-            cache.clone(),
-            GrpcMakeConnector::new(),
-        ));
+        let make_connector = GrpcMakeConnector::new();
+        let discovery: Arc<dyn ClusterDiscovery<EndpointAddress, EndpointChannel<Channel>>> =
+            Arc::new(XdsClusterDiscovery::new(cache.clone(), make_connector));
 
-        // Cluster clients are created and destroyed only here, by the
-        // route-config reconcile; the request path can only look them up.
+        // Cluster clients are created and destroyed only by the route-config
+        // reconcile through this sync handle; the request path can only look
+        // them up.
         let cluster_registry = Arc::new(ClusterClientRegistryGrpc::new());
-        let on_active_clusters: crate::xds::resource_manager::OnActiveClusters = {
-            let registry = cluster_registry.clone();
-            let discovery = discovery.clone();
-            Arc::new(move |active| {
-                registry.sync_clusters(active, |name| discovery.discover_cluster(name))
-            })
-        };
+        let cluster_sync = Arc::new(RegistryClusterSync::new(
+            cluster_registry.clone(),
+            discovery,
+        ));
         let resource_manager = XdsResourceManager::new(
             xds_client.clone(),
             cache.clone(),
             listener_name,
-            on_active_clusters,
+            cluster_sync,
         );
 
         Ok(self.build_from_cache(cluster_registry, cache, xds_client, resource_manager))
@@ -441,7 +431,7 @@ impl XdsChannelBuilder {
         let routing_layer = XdsRoutingLayer::new(router, interceptor, self.authority());
         let retry_layer = RetryLayer::new(retry);
         let cluster_registry = Arc::new(ClusterClientRegistryGrpc::new());
-        cluster_registry.sync_clusters(&clusters.iter().map(|s| s.to_string()).collect(), |name| {
+        cluster_registry.add_clusters(&clusters.iter().map(|s| s.to_string()).collect(), |name| {
             discovery.discover_cluster(name)
         });
         let lb_service = XdsLbService::new(cluster_registry);
@@ -793,23 +783,17 @@ mod tests {
         let router: Arc<dyn Router> = Arc::new(XdsRouter::new(&cache));
 
         #[cfg(feature = "_tls-any")]
-        let discovery: Arc<
-            dyn ClusterDiscovery<EndpointAddress, EndpointChannel<Channel>>,
-        > = {
+        let make_connector = {
             use crate::xds::cert_provider::CertProviderRegistry;
-            let registry = Arc::new(
+            GrpcMakeConnector::new(Arc::new(
                 CertProviderRegistry::from_bootstrap(&Default::default(), Default::default())
                     .unwrap(),
-            );
-            Arc::new(XdsClusterDiscovery::new(
-                cache,
-                GrpcMakeConnector::new(registry),
             ))
         };
         #[cfg(not(feature = "_tls-any"))]
-        let discovery: Arc<
-            dyn ClusterDiscovery<EndpointAddress, EndpointChannel<Channel>>,
-        > = Arc::new(XdsClusterDiscovery::new(cache, GrpcMakeConnector::new()));
+        let make_connector = GrpcMakeConnector::new();
+        let discovery: Arc<dyn ClusterDiscovery<EndpointAddress, EndpointChannel<Channel>>> =
+            Arc::new(XdsClusterDiscovery::new(cache, make_connector));
 
         let builder = XdsChannelBuilder::new(test_config());
         builder.build_grpc_channel_from_parts(
@@ -907,6 +891,43 @@ mod tests {
         }
     }
 
+    /// A request queued against a cluster whose endpoints never arrived must
+    /// fail with UNAVAILABLE when the cluster is evicted (its cache entries
+    /// removed), instead of hanging forever in the balancer and pinning the
+    /// evicted client's resources.
+    #[tokio::test]
+    async fn queued_request_fails_unavailable_when_cluster_evicted() {
+        let cluster_name = "test-cluster";
+        let cache = Arc::new(XdsCache::new());
+        cache.update_route_config(make_test_route_config(cluster_name));
+        cache.update_cluster(cluster_name, make_test_cluster(cluster_name));
+        // No endpoints: the request queues in the cluster's balancer.
+
+        let channel = build_xds_channel_from_cache(cache.clone()).await;
+        let mut client = GreeterClient::new(channel);
+
+        // Let the request reach the balancer queue, then evict the cluster.
+        // The eviction future never resolves, so `select!` always yields the
+        // request's outcome.
+        let evict = async {
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            cache.remove_cluster(cluster_name);
+            cache.remove_endpoints(cluster_name);
+            std::future::pending::<()>().await
+        };
+
+        let result = tokio::time::timeout(tokio::time::Duration::from_secs(5), async {
+            tokio::select! {
+                res = client.say_hello(HelloRequest { name: "stuck".to_string() }) => res,
+                _ = evict => unreachable!(),
+            }
+        })
+        .await
+        .expect("request must fail once the cluster is evicted, not hang");
+        let status = result.expect_err("request must fail without endpoints");
+        assert_eq!(status.code(), tonic::Code::Unavailable, "got: {status}");
+    }
+
     #[test]
     fn config_stores_call_credentials() {
         #[derive(Debug)]
@@ -931,6 +952,12 @@ mod tests {
     async fn test_build_from_cache_smoke() {
         use crate::xds::resource_manager::XdsResourceManager;
 
+        struct NoopSync;
+        impl crate::xds::resource_manager::ActiveClusterSync for NoopSync {
+            fn add_clusters(&self, _active: &std::collections::HashSet<String>) {}
+            fn evict_clusters(&self, _keep: &std::collections::HashSet<String>) {}
+        }
+
         let cache = Arc::new(XdsCache::new());
         let cluster_registry = Arc::new(crate::client::cluster::ClusterClientRegistryGrpc::new());
         let xds_client = xds_client::XdsClient::disconnected();
@@ -938,7 +965,7 @@ mod tests {
             xds_client.clone(),
             cache.clone(),
             "test-listener".into(),
-            Arc::new(|_: &std::collections::HashSet<String>| {}),
+            Arc::new(NoopSync),
         );
 
         let builder = XdsChannelBuilder::new(test_config());

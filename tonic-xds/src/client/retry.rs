@@ -70,6 +70,24 @@ pub(crate) fn is_retryable_connection_error(err: &(dyn std::error::Error + 'stat
     false
 }
 
+/// Find a gRPC [`Status`](tonic::Status) in an error's source chain and
+/// return its code.
+///
+/// LB-level failures surface as a `tonic::Status` wrapped in tower
+/// buffer/balance errors — e.g. UNAVAILABLE when a request races the
+/// eviction of its cluster — and their codes should follow the same retry
+/// policy as codes read from `grpc-status` response headers.
+fn grpc_status_code_in_chain(err: &(dyn std::error::Error + 'static)) -> Option<tonic::Code> {
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(e) = current {
+        if let Some(status) = e.downcast_ref::<tonic::Status>() {
+            return Some(status.code());
+        }
+        current = e.source();
+    }
+    None
+}
+
 /// Check if a gRPC status code is retryable according to the given policy.
 pub(crate) fn is_retryable_grpc_status_code(
     code: tonic::Code,
@@ -232,7 +250,11 @@ impl Default for GrpcRetryClassifier {
 impl RetryClassifier for GrpcRetryClassifier {
     fn is_retryable<Res>(&self, res: &Result<http::Response<Res>, tower::BoxError>) -> bool {
         match res {
-            Err(err) => is_retryable_connection_error(err.as_ref()),
+            Err(err) => {
+                is_retryable_connection_error(err.as_ref())
+                    || grpc_status_code_in_chain(err.as_ref())
+                        .is_some_and(|code| is_retryable_grpc_status_code(code, &self.retry_on))
+            }
             Ok(response) if is_local_circuit_breaker_drop(response) => false,
             Ok(response) => match tonic::Status::from_header_map(response.headers()) {
                 Some(status) => is_retryable_grpc_status_code(status.code(), &self.retry_on),

@@ -73,6 +73,19 @@ const ENDPOINT_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(30);
 /// Time to wait for a keepalive PING ack before closing the connection.
 const ENDPOINT_KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Error emitted into a cluster's discovery stream when its cache watches
+/// close, i.e. the cluster was evicted from the route config.
+///
+/// Carries a `tonic::Status` so callers observe UNAVAILABLE (tonic recovers
+/// a `Status` from anywhere in an error's source chain, through the
+/// balancer's and buffer's wrapper errors) and status-based retry policies
+/// can act on it, rather than an opaque `Unknown` discovery error.
+fn cluster_evicted_error(cluster_name: &str) -> BoxError {
+    Box::new(tonic::Status::unavailable(format!(
+        "cluster '{cluster_name}' was removed from the route configuration"
+    )))
+}
+
 /// Apply connection-liveness settings to a per-endpoint `Endpoint`.
 ///
 /// Endpoint channels are created with `connect_lazy`, so a tonic `Channel`
@@ -126,8 +139,17 @@ impl<MC: MakeConnector> ClusterDiscovery<EndpointAddress, MC::Service> for XdsCl
             let connector_swap: ConnectorSwap<MC::Service> = loop {
                 let cluster = tokio::select! {
                     maybe_cluster = cluster_watch.next() => {
-                        let Some(cluster) = maybe_cluster else { return };
-                        cluster
+                        match maybe_cluster {
+                            Some(cluster) => cluster,
+                            // The cluster was removed from the cache before
+                            // its first CDS update. Fail the balancer so
+                            // queued requests error out instead of waiting
+                            // forever on endpoints that will never arrive.
+                            None => {
+                                let _ = tx.send(Err(cluster_evicted_error(&cluster_name))).await;
+                                return;
+                            }
+                        }
                     }
                     // The LB side dropped the discovery stream (e.g. the
                     // cluster's client was evicted); exit instead of parking
@@ -149,9 +171,24 @@ impl<MC: MakeConnector> ClusterDiscovery<EndpointAddress, MC::Service> for XdsCl
 
             loop {
                 tokio::select! {
-                    Some(change) = endpoints.next() => {
-                        if tx.send(change).await.is_err() {
-                            return;
+                    change = endpoints.next() => {
+                        match change {
+                            Some(change) => {
+                                if tx.send(change).await.is_err() {
+                                    return;
+                                }
+                            }
+                            // The endpoint stream ended: the cluster left the
+                            // route config and its cache entries were removed.
+                            // Surface an error so the balancer fails queued
+                            // requests with UNAVAILABLE — and, as they
+                            // complete, the evicted client's Buffer, channels,
+                            // and this task all unwind — instead of leaving
+                            // them Pending forever on an empty balancer.
+                            None => {
+                                let _ = tx.send(Err(cluster_evicted_error(&cluster_name))).await;
+                                return;
+                            }
                         }
                     }
                     Some(cluster) = cluster_watch.next() => {
@@ -165,7 +202,6 @@ impl<MC: MakeConnector> ClusterDiscovery<EndpointAddress, MC::Service> for XdsCl
                         }
                     }
                     _ = tx.closed() => return,
-                    else => return,
                 }
             }
         });
