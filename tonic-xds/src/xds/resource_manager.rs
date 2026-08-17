@@ -85,8 +85,8 @@ impl XdsResourceManager {
     /// * `cache` - The shared cache to write resources into
     /// * `listener_name` - The LDS resource name to watch (from target URI)
     /// * `on_active_clusters` - Invoked with the authoritative cluster set on
-    ///   every route-config reconcile, so cached clients for clusters outside
-    ///   that set can be released
+    ///   every route-config reconcile, so per-cluster clients can be created
+    ///   and destroyed to match it
     pub(crate) fn new(
         xds_client: XdsClient,
         cache: Arc<XdsCache>,
@@ -102,11 +102,8 @@ impl XdsResourceManager {
 }
 
 /// Callback invoked with the authoritative cluster set on every route-config
-/// reconcile, so per-cluster clients (cached by `ClusterClientRegistry`) for
-/// clusters outside that set can be evicted instead of accumulating for every
-/// cluster name ever routed to. It receives the full set rather than removed
-/// names so that entries re-inserted by requests racing an eviction are also
-/// dropped on the next reconcile.
+/// reconcile. Wired to `ClusterClientRegistry::sync_clusters` (see its doc),
+/// which creates and destroys per-cluster clients to match the set.
 pub(crate) type OnActiveClusters = Arc<dyn Fn(&HashSet<String>) + Send + Sync>;
 
 /// Mutable state for the entire LDS -> RDS -> CDS -> EDS cascade.
@@ -207,8 +204,11 @@ impl CascadeState {
                         self.rds_name = None;
 
                         let rc = Arc::new(rc.clone());
-                        cache.update_route_config(Arc::clone(&rc));
+                        // Reconcile before publishing so the cluster client
+                        // registry learns the new active set before the
+                        // router can route on the new config.
                         self.reconcile_clusters(&rc, xds_client, cache).await;
+                        cache.update_route_config(Arc::clone(&rc));
                     }
                     RouteSource::Rds(rds_name) => {
                         if self.rds_name.as_deref() != Some(rds_name) {
@@ -241,8 +241,11 @@ impl CascadeState {
                 result: Ok(rc),
                 done,
             } => {
-                cache.update_route_config(Arc::clone(&rc));
+                // Reconcile before publishing so the cluster client registry
+                // learns the new active set before the router can route on
+                // the new config.
                 self.reconcile_clusters(&rc, xds_client, cache).await;
+                cache.update_route_config(Arc::clone(&rc));
                 drop(done);
             }
             // Per gRFC A88: keep using cached resources on data errors.
@@ -313,6 +316,12 @@ impl CascadeState {
         let new_clusters = route_config.cluster_names();
         let old_clusters: HashSet<String> = self.cds_watchers.keys().cloned().collect();
 
+        // Fired before the route config is published to the cache (callers
+        // publish after reconciling), so a newly added cluster has its client
+        // before the router can route to it. See
+        // `ClusterClientRegistry::sync_clusters` for the eviction rationale.
+        (self.on_active_clusters)(&new_clusters);
+
         for name in old_clusters.difference(&new_clusters) {
             self.cds_watchers.remove(name);
             self.eds_watchers.remove(name);
@@ -320,11 +329,6 @@ impl CascadeState {
             cache.remove_cluster(name);
             cache.remove_endpoints(name);
         }
-
-        // Fired on every reconcile (not just when the diff removed something)
-        // so that registry entries re-inserted by requests racing a previous
-        // eviction are dropped as well.
-        (self.on_active_clusters)(&new_clusters);
 
         for name in new_clusters.difference(&old_clusters) {
             let watcher = xds_client.watch::<ClusterResource>(name).await;
@@ -348,6 +352,12 @@ mod tests {
 
     fn test_cache() -> Arc<XdsCache> {
         Arc::new(XdsCache::new())
+    }
+
+    /// `CascadeState` with a no-op active-clusters callback, for tests that
+    /// don't care about client eviction.
+    fn test_state() -> CascadeState {
+        CascadeState::new(Arc::new(|_| {}))
     }
 
     fn make_route_config(name: &str, clusters: &[&str]) -> Arc<RouteConfigResource> {
@@ -433,7 +443,7 @@ mod tests {
     async fn reconcile_adds_new_clusters() {
         let cache = test_cache();
         let client = test_client();
-        let mut state = CascadeState::new(Arc::new(|_: &HashSet<String>| {}));
+        let mut state = test_state();
 
         let rc = make_route_config("rc", &["a", "b"]);
         state.reconcile_clusters(&rc, &client, &cache).await;
@@ -447,7 +457,7 @@ mod tests {
     async fn reconcile_removes_old_clusters() {
         let cache = test_cache();
         let client = test_client();
-        let mut state = CascadeState::new(Arc::new(|_: &HashSet<String>| {}));
+        let mut state = test_state();
 
         let rc1 = make_route_config("rc", &["a", "b"]);
         state.reconcile_clusters(&rc1, &client, &cache).await;
@@ -461,11 +471,9 @@ mod tests {
         assert_eq!(state.cds_watchers.keys().count(), 2);
     }
 
-    /// Regression test for cluster resurrection: every reconcile must hand
-    /// the authoritative cluster set to `on_active_clusters` so
-    /// `ClusterClientRegistry` can drop clients outside it — including
-    /// entries re-inserted by requests racing a previous eviction, which a
-    /// removal-diff callback would never see again.
+    /// Every reconcile must hand the full authoritative cluster set to
+    /// `on_active_clusters` — not a removal diff — see
+    /// `ClusterClientRegistry::sync_clusters` for why.
     #[tokio::test]
     async fn reconcile_fires_on_active_clusters_with_authoritative_set() {
         let cache = test_cache();
@@ -486,8 +494,8 @@ mod tests {
         let rc2 = make_route_config("rc", &["b"]);
         state.reconcile_clusters(&rc2, &client, &cache).await;
 
-        // Fires even when nothing was removed: this is what evicts registry
-        // entries resurrected between reconciles.
+        // Fires even when nothing was removed, keeping the registry's
+        // recorded active set authoritative on every route update.
         let rc3 = make_route_config("rc", &["b"]);
         state.reconcile_clusters(&rc3, &client, &cache).await;
 
@@ -509,7 +517,7 @@ mod tests {
     async fn reconcile_to_empty_removes_all() {
         let cache = test_cache();
         let client = test_client();
-        let mut state = CascadeState::new(Arc::new(|_: &HashSet<String>| {}));
+        let mut state = test_state();
 
         let rc1 = make_route_config("rc", &["a"]);
         state.reconcile_clusters(&rc1, &client, &cache).await;
@@ -524,7 +532,7 @@ mod tests {
     async fn handle_rds_ok_updates_cache_and_reconciles() {
         let cache = test_cache();
         let client = test_client();
-        let mut state = CascadeState::new(Arc::new(|_: &HashSet<String>| {}));
+        let mut state = test_state();
 
         let rc = make_route_config("rc-1", &["cluster-a", "cluster-b"]);
         state.handle_rds(ok_event(rc), &client, &cache).await;
@@ -539,7 +547,7 @@ mod tests {
     async fn handle_rds_err_preserves_state() {
         let cache = test_cache();
         let client = test_client();
-        let mut state = CascadeState::new(Arc::new(|_: &HashSet<String>| {}));
+        let mut state = test_state();
 
         let rc = make_route_config("rc", &["c1"]);
         state.handle_rds(ok_event(rc), &client, &cache).await;
@@ -554,7 +562,7 @@ mod tests {
     async fn handle_rds_ambient_error_preserves_state() {
         let cache = test_cache();
         let client = test_client();
-        let mut state = CascadeState::new(Arc::new(|_: &HashSet<String>| {}));
+        let mut state = test_state();
 
         let rc = make_route_config("rc", &["c1"]);
         state.handle_rds(ok_event(rc), &client, &cache).await;
@@ -568,7 +576,7 @@ mod tests {
     async fn handle_lds_inline_writes_route_config() {
         let cache = test_cache();
         let client = test_client();
-        let mut state = CascadeState::new(Arc::new(|_: &HashSet<String>| {}));
+        let mut state = test_state();
 
         state
             .handle_lds(ok_event(make_listener_inline(&["c1"])), &client, &cache)
@@ -585,7 +593,7 @@ mod tests {
     async fn handle_lds_inline_clears_existing_rds() {
         let cache = test_cache();
         let client = test_client();
-        let mut state = CascadeState::new(Arc::new(|_: &HashSet<String>| {}));
+        let mut state = test_state();
 
         state
             .handle_lds(ok_event(make_listener_rds("rc-1")), &client, &cache)
@@ -604,7 +612,7 @@ mod tests {
     async fn handle_lds_rds_sets_watcher_and_name() {
         let cache = test_cache();
         let client = test_client();
-        let mut state = CascadeState::new(Arc::new(|_: &HashSet<String>| {}));
+        let mut state = test_state();
 
         state
             .handle_lds(ok_event(make_listener_rds("my-route")), &client, &cache)
@@ -618,7 +626,7 @@ mod tests {
     async fn handle_lds_rds_same_name_reuses_watcher() {
         let cache = test_cache();
         let client = test_client();
-        let mut state = CascadeState::new(Arc::new(|_: &HashSet<String>| {}));
+        let mut state = test_state();
 
         state
             .handle_lds(ok_event(make_listener_rds("rc")), &client, &cache)
@@ -637,7 +645,7 @@ mod tests {
     async fn handle_lds_rds_different_name_replaces_watcher() {
         let cache = test_cache();
         let client = test_client();
-        let mut state = CascadeState::new(Arc::new(|_: &HashSet<String>| {}));
+        let mut state = test_state();
 
         state
             .handle_lds(ok_event(make_listener_rds("rc-1")), &client, &cache)
@@ -654,7 +662,7 @@ mod tests {
     async fn handle_lds_err_preserves_state() {
         let cache = test_cache();
         let client = test_client();
-        let mut state = CascadeState::new(Arc::new(|_: &HashSet<String>| {}));
+        let mut state = test_state();
 
         state
             .handle_lds(ok_event(make_listener_inline(&["c1"])), &client, &cache)
@@ -677,7 +685,7 @@ mod tests {
     async fn handle_lds_ambient_error_preserves_state() {
         let cache = test_cache();
         let client = test_client();
-        let mut state = CascadeState::new(Arc::new(|_: &HashSet<String>| {}));
+        let mut state = test_state();
 
         state
             .handle_lds(ok_event(make_listener_rds("rc")), &client, &cache)
@@ -743,7 +751,7 @@ mod tests {
             .expect("watcher closed");
 
         let cache = test_cache();
-        let mut state = CascadeState::new(Arc::new(|_: &HashSet<String>| {}));
+        let mut state = test_state();
         tokio::time::timeout(
             Duration::from_secs(10),
             state.handle_rds(event, &xds_client, &cache),

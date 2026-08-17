@@ -229,14 +229,33 @@ where
             registry: DashMap::new(),
         }
     }
-    /// Get the client of a cluster with lazy discovery.
-    pub(crate) fn get_cluster<F, D>(
-        &self,
-        key: &str,
-        discover_fn: F,
-    ) -> Arc<ClusterClient<Req, Resp>>
+
+    /// Looks up the client for a cluster.
+    ///
+    /// Returns `None` for clusters outside the set from the last
+    /// [`sync_clusters`](Self::sync_clusters) call — e.g. a request carrying
+    /// a route decision for a cluster that has since left the route config.
+    /// Callers must fail the request; only `sync_clusters` creates clients.
+    pub(crate) fn get_cluster(&self, key: &str) -> Option<Arc<ClusterClient<Req, Resp>>> {
+        self.registry
+            .get(key)
+            .map(|entry| Arc::clone(entry.value()))
+    }
+
+    /// Reconciles the registry against `active`, the authoritative cluster
+    /// set from the current route configuration: drops every client outside
+    /// it and creates one (via `discover_fn`) for each newly added cluster.
+    ///
+    /// This is the only way clients enter the registry — the request path
+    /// ([`get_cluster`](Self::get_cluster)) can only look them up. Creating
+    /// clients on the request path would let a request racing an eviction
+    /// (e.g. a retry carrying a stale route decision) re-insert a
+    /// just-removed cluster as a permanently-unready client that hangs
+    /// requests and leaks for the channel's lifetime. In-flight requests
+    /// keep their clones of an evicted client alive until they complete.
+    pub(crate) fn sync_clusters<F, D>(&self, active: &HashSet<String>, mut discover_fn: F)
     where
-        F: FnOnce() -> D,
+        F: FnMut(&str) -> D,
         D: Discover + Unpin + Send + 'static,
         D::Key: std::hash::Hash + Clone + Send,
         D::Error: Into<BoxError>,
@@ -245,27 +264,12 @@ where
         <D::Service as Service<Req>>::Error: Into<BoxError>,
         <D::Service as Service<Req>>::Future: Send + 'static,
     {
-        self.registry
-            .entry(key.to_string())
-            .or_insert_with(|| {
-                let name = key.to_string();
-                let discover = discover_fn();
-                Arc::new(ClusterClient::new(name, discover))
-            })
-            .clone()
-    }
-
-    /// Drops every client whose cluster is not in `active`, the authoritative
-    /// cluster set from the current route configuration.
-    ///
-    /// In-flight requests keep their clones alive until they complete. This
-    /// takes the full set rather than the removed names because a request
-    /// racing an eviction (e.g. a retry carrying a stale route decision) can
-    /// re-insert a just-removed cluster through `get_cluster`; reconciling
-    /// against the authoritative set on every route update drops such
-    /// entries too, instead of leaking them for the channel's lifetime.
-    pub(crate) fn retain_clusters(&self, active: &HashSet<String>) {
         self.registry.retain(|name, _| active.contains(name));
+        for name in active {
+            self.registry
+                .entry(name.clone())
+                .or_insert_with(|| Arc::new(ClusterClient::new(name.clone(), discover_fn(name))));
+        }
     }
 }
 
@@ -284,3 +288,64 @@ where
 #[allow(dead_code)]
 pub(crate) type ClusterClientRegistryGrpc =
     ClusterClientRegistry<Request<TonicBody>, Response<TonicBody>>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::client::endpoint::{EndpointAddress, EndpointChannel};
+    use crate::client::lb::BoxDiscover;
+    use tokio_stream::wrappers::ReceiverStream;
+    use tonic::transport::Channel;
+
+    fn empty_discover(_name: &str) -> BoxDiscover<EndpointAddress, EndpointChannel<Channel>> {
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        Box::pin(ReceiverStream::new(rx))
+    }
+
+    fn set(names: &[&str]) -> HashSet<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[tokio::test]
+    async fn get_cluster_only_finds_synced_clusters() {
+        let registry = ClusterClientRegistryGrpc::new();
+        assert!(registry.get_cluster("a").is_none());
+
+        registry.sync_clusters(&set(&["a"]), empty_discover);
+        assert!(registry.get_cluster("a").is_some());
+        assert!(registry.get_cluster("b").is_none());
+    }
+
+    /// A request racing an eviction (stale route decision) gets a lookup
+    /// miss — it cannot resurrect the evicted client — and a cluster
+    /// re-entering the config gets a fresh client rather than the old one.
+    #[tokio::test]
+    async fn sync_clusters_evicts_and_recreates() {
+        let registry = ClusterClientRegistryGrpc::new();
+        registry.sync_clusters(&set(&["a"]), empty_discover);
+        let first = registry.get_cluster("a").unwrap();
+
+        registry.sync_clusters(&set(&[]), empty_discover);
+        assert!(registry.get_cluster("a").is_none());
+
+        registry.sync_clusters(&set(&["a"]), empty_discover);
+        let second = registry.get_cluster("a").unwrap();
+        assert!(
+            !Arc::ptr_eq(&first, &second),
+            "a re-added cluster must get a fresh client, not the evicted one",
+        );
+    }
+
+    /// Re-syncing with an unchanged set keeps the existing clients (and
+    /// their warm connections) instead of rebuilding them.
+    #[tokio::test]
+    async fn sync_clusters_keeps_existing_clients() {
+        let registry = ClusterClientRegistryGrpc::new();
+        registry.sync_clusters(&set(&["a"]), empty_discover);
+        let first = registry.get_cluster("a").unwrap();
+
+        registry.sync_clusters(&set(&["a", "b"]), empty_discover);
+        let same = registry.get_cluster("a").unwrap();
+        assert!(Arc::ptr_eq(&first, &same));
+    }
+}

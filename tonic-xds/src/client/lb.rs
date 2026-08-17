@@ -30,7 +30,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use tower::ServiceExt;
-use tower::{BoxError, Service, discover::Change, load::Load};
+use tower::{BoxError, Service, discover::Change};
 
 /// A pinned, boxed stream of endpoint changes for Tower's `Discover`-based
 /// load balancers.
@@ -51,63 +51,56 @@ pub(crate) trait ClusterDiscovery<Endpoint, S>: Send + Sync + 'static {
 pub(crate) enum LoadBalancingError {
     #[error("No routing decision extension from the routing layer available")]
     NoRoutingDecision,
+    #[error("no client for cluster '{0}': not in the current route configuration")]
+    ClusterNotFound(String),
 }
 
-/// A Tower Service that performs load balancing based on routing decisions.
-pub(crate) struct XdsLbService<Req, Endpoint, S>
+/// A Tower Service that forwards each request to the client of the cluster
+/// chosen by the routing layer.
+///
+/// This is a pure lookup: cluster clients are created and destroyed only by
+/// the route-config reconcile (via `ClusterClientRegistry::sync_clusters`),
+/// never by the request path. A request whose decision names a cluster with
+/// no client — e.g. one that left the route config after the decision was
+/// made — fails fast instead of waiting on a cluster that will never be
+/// ready.
+pub(crate) struct XdsLbService<Req, Resp>
 where
     Req: Send + 'static,
-    S: Service<Req>,
-    S::Response: Send + 'static,
+    Resp: 'static,
 {
-    cluster_registry: Arc<ClusterClientRegistry<Req, S::Response>>,
-    cluster_discovery: Arc<dyn ClusterDiscovery<Endpoint, S>>,
+    cluster_registry: Arc<ClusterClientRegistry<Req, Resp>>,
 }
 
-impl<Req, Endpoint, S> XdsLbService<Req, Endpoint, S>
+impl<Req, Resp> XdsLbService<Req, Resp>
 where
     Req: Send + 'static,
-    S: Service<Req>,
-    S::Response: Send + 'static,
+    Resp: 'static,
 {
-    /// Creates a new `XdsLbService` with the given cluster client registry and cluster discovery.
-    pub(crate) fn new(
-        cluster_registry: Arc<ClusterClientRegistry<Req, S::Response>>,
-        cluster_discovery: Arc<dyn ClusterDiscovery<Endpoint, S>>,
-    ) -> Self {
-        Self {
-            cluster_registry,
-            cluster_discovery,
-        }
+    /// Creates a new `XdsLbService` with the given cluster client registry.
+    pub(crate) fn new(cluster_registry: Arc<ClusterClientRegistry<Req, Resp>>) -> Self {
+        Self { cluster_registry }
     }
 }
 
-impl<Req, Endpoint, S> Clone for XdsLbService<Req, Endpoint, S>
+impl<Req, Resp> Clone for XdsLbService<Req, Resp>
 where
     Req: Send + 'static,
-    S: Service<Req>,
-    S::Response: Send + 'static,
+    Resp: 'static,
 {
     fn clone(&self) -> Self {
         Self {
             cluster_registry: self.cluster_registry.clone(),
-            cluster_discovery: self.cluster_discovery.clone(),
         }
     }
 }
 
-impl<B, Endpoint, S> Service<Request<B>> for XdsLbService<Request<B>, Endpoint, S>
+impl<B, Resp> Service<Request<B>> for XdsLbService<Request<B>, Resp>
 where
     Request<B>: Send + 'static,
-    S::Response: Send + 'static,
-    Endpoint: std::hash::Hash + Eq + Clone + Send + 'static,
-    S: Service<Request<B>> + Load + Send + 'static,
-    S::Response: Send + 'static,
-    S::Error: Into<BoxError>,
-    S::Future: Send,
-    <S as tower::load::Load>::Metric: std::fmt::Debug,
+    Resp: Send + 'static,
 {
-    type Response = S::Response;
+    type Response = Resp;
     type Error = BoxError;
     type Future = BoxFuture<Result<Self::Response, Self::Error>>;
 
@@ -124,13 +117,12 @@ where
             return Box::pin(async move { Err(LoadBalancingError::NoRoutingDecision.into()) });
         };
 
-        // Get or create the cluster client for the target xDS cluster.
-        let cluster_client = self
-            .cluster_registry
-            .get_cluster(&routing_decision.cluster, || {
-                self.cluster_discovery
-                    .discover_cluster(&routing_decision.cluster)
+        let Some(cluster_client) = self.cluster_registry.get_cluster(&routing_decision.cluster)
+        else {
+            return Box::pin(async move {
+                Err(LoadBalancingError::ClusterNotFound(routing_decision.cluster).into())
             });
+        };
 
         // Get the transport channel for the target xDS cluster.
         // The actual load-balancing will be performed by the cluster's balancer.

@@ -124,8 +124,15 @@ impl<MC: MakeConnector> ClusterDiscovery<EndpointAddress, MC::Service> for XdsCl
             let mut cluster_watch = cache.watch_cluster(&cluster_name);
 
             let connector_swap: ConnectorSwap<MC::Service> = loop {
-                let Some(cluster) = cluster_watch.next().await else {
-                    return;
+                let cluster = tokio::select! {
+                    maybe_cluster = cluster_watch.next() => {
+                        let Some(cluster) = maybe_cluster else { return };
+                        cluster
+                    }
+                    // The LB side dropped the discovery stream (e.g. the
+                    // cluster's client was evicted); exit instead of parking
+                    // forever on a watch that may never fire again.
+                    _ = tx.closed() => return,
                 };
                 match make_connector.make_connector(ClusterConfig::from_resource(&cluster)) {
                     Ok(c) => break Arc::new(ArcSwap::from_pointee(c)),
@@ -157,6 +164,7 @@ impl<MC: MakeConnector> ClusterDiscovery<EndpointAddress, MC::Service> for XdsCl
                             ),
                         }
                     }
+                    _ = tx.closed() => return,
                     else => return,
                 }
             }

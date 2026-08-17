@@ -343,10 +343,31 @@ impl XdsChannelBuilder {
         let xds_client = client_builder.build();
 
         let cache = Arc::new(XdsCache::new());
+
+        #[cfg(feature = "_tls-any")]
+        let discovery: Arc<
+            dyn ClusterDiscovery<EndpointAddress, EndpointChannel<Channel>>,
+        > = Arc::new(XdsClusterDiscovery::new(
+            cache.clone(),
+            GrpcMakeConnector::new(cert_provider_registry),
+        ));
+        #[cfg(not(feature = "_tls-any"))]
+        let discovery: Arc<
+            dyn ClusterDiscovery<EndpointAddress, EndpointChannel<Channel>>,
+        > = Arc::new(XdsClusterDiscovery::new(
+            cache.clone(),
+            GrpcMakeConnector::new(),
+        ));
+
+        // Cluster clients are created and destroyed only here, by the
+        // route-config reconcile; the request path can only look them up.
         let cluster_registry = Arc::new(ClusterClientRegistryGrpc::new());
         let on_active_clusters: crate::xds::resource_manager::OnActiveClusters = {
             let registry = cluster_registry.clone();
-            Arc::new(move |active| registry.retain_clusters(active))
+            let discovery = discovery.clone();
+            Arc::new(move |active| {
+                registry.sync_clusters(active, |name| discovery.discover_cluster(name))
+            })
         };
         let resource_manager = XdsResourceManager::new(
             xds_client.clone(),
@@ -355,14 +376,7 @@ impl XdsChannelBuilder {
             on_active_clusters,
         );
 
-        Ok(self.build_from_cache(
-            cluster_registry,
-            cache,
-            #[cfg(feature = "_tls-any")]
-            cert_provider_registry,
-            xds_client,
-            resource_manager,
-        ))
+        Ok(self.build_from_cache(cluster_registry, cache, xds_client, resource_manager))
     }
 
     /// Internal builder that wires the service stack from a pre-built cache.
@@ -373,7 +387,6 @@ impl XdsChannelBuilder {
         &self,
         cluster_registry: Arc<ClusterClientRegistryGrpc>,
         cache: Arc<XdsCache>,
-        #[cfg(feature = "_tls-any")] cert_provider_registry: Arc<CertProviderRegistry>,
         xds_client: XdsClient,
         resource_manager: XdsResourceManager,
     ) -> XdsChannelGrpc {
@@ -384,25 +397,13 @@ impl XdsChannelBuilder {
         // come from RDS via the request's `RouteDecision`; see `RetryLayer`.
         let retry_layer = RetryLayer::new(Arc::new(GrpcRetrySharedConfig::default()));
 
-        #[cfg(feature = "_tls-any")]
-        let discovery: Arc<
-            dyn ClusterDiscovery<EndpointAddress, EndpointChannel<Channel>>,
-        > = Arc::new(XdsClusterDiscovery::new(
-            cache,
-            GrpcMakeConnector::new(cert_provider_registry),
-        ));
-        #[cfg(not(feature = "_tls-any"))]
-        let discovery: Arc<
-            dyn ClusterDiscovery<EndpointAddress, EndpointChannel<Channel>>,
-        > = Arc::new(XdsClusterDiscovery::new(cache, GrpcMakeConnector::new()));
-
         let resources = Arc::new(XdsChannelResources {
             _resource_manager: resource_manager,
             _xds_client: xds_client,
         });
 
         let routing_layer = XdsRoutingLayer::new(router, self.pre_route.clone(), self.authority());
-        let lb_service = XdsLbService::new(cluster_registry, discovery);
+        let lb_service = XdsLbService::new(cluster_registry);
         let inner = ServiceBuilder::new()
             .layer(routing_layer)
             .layer(retry_layer)
@@ -426,7 +427,8 @@ impl XdsChannelBuilder {
     }
 
     /// Builds an `XdsChannelGrpc` from the given router, cluster discovery, retry
-    /// config, and optional pre-route interceptor.
+    /// config, and optional pre-route interceptor. `clusters` seeds the client
+    /// registry (there is no resource-manager reconcile to do it).
     #[cfg(test)]
     pub(crate) fn build_grpc_channel_from_parts(
         &self,
@@ -434,11 +436,15 @@ impl XdsChannelBuilder {
         discovery: Arc<dyn ClusterDiscovery<EndpointAddress, EndpointChannel<Channel>>>,
         retry: Arc<GrpcRetrySharedConfig>,
         interceptor: Option<Arc<dyn PreRouteInterceptor>>,
+        clusters: &[&str],
     ) -> XdsChannelGrpc {
         let routing_layer = XdsRoutingLayer::new(router, interceptor, self.authority());
         let retry_layer = RetryLayer::new(retry);
         let cluster_registry = Arc::new(ClusterClientRegistryGrpc::new());
-        let lb_service = XdsLbService::new(cluster_registry, discovery);
+        cluster_registry.sync_clusters(&clusters.iter().map(|s| s.to_string()).collect(), |name| {
+            discovery.discover_cluster(name)
+        });
+        let lb_service = XdsLbService::new(cluster_registry);
         let inner = ServiceBuilder::new()
             .layer(routing_layer)
             .layer(retry_layer)
@@ -626,6 +632,7 @@ mod tests {
             xds_manager.clone(),
             Arc::new(GrpcRetrySharedConfig::default()),
             None,
+            &["test-cluster"],
         );
 
         let client = GreeterClient::new(xds_channel);
@@ -703,6 +710,7 @@ mod tests {
             xds_manager.clone(),
             retry,
             None,
+            &["test-cluster"],
         );
 
         let mut client = GreeterClient::new(xds_channel);
@@ -809,6 +817,7 @@ mod tests {
             discovery,
             Arc::new(GrpcRetrySharedConfig::default()),
             None,
+            &["test-cluster"],
         )
     }
 
@@ -933,23 +942,6 @@ mod tests {
         );
 
         let builder = XdsChannelBuilder::new(test_config());
-
-        #[cfg(feature = "_tls-any")]
-        let _channel = {
-            use crate::xds::cert_provider::CertProviderRegistry;
-            let registry = Arc::new(
-                CertProviderRegistry::from_bootstrap(&Default::default(), Default::default())
-                    .unwrap(),
-            );
-            builder.build_from_cache(
-                cluster_registry,
-                cache,
-                registry,
-                xds_client,
-                resource_manager,
-            )
-        };
-        #[cfg(not(feature = "_tls-any"))]
         let _channel =
             builder.build_from_cache(cluster_registry, cache, xds_client, resource_manager);
         // Construction should succeed without panicking.
