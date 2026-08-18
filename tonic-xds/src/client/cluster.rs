@@ -251,8 +251,8 @@ where
     /// that doesn't already have one. Never drops clients — that is
     /// [`evict_clusters`](Self::evict_clusters)' job, and the two run at
     /// different points of a reconcile: additions must land before the
-    /// route config referencing them is published, while evictions wait out
-    /// a removal grace period (see `XdsResourceManager`).
+    /// route config referencing them is published, evictions only after
+    /// (see `XdsResourceManager`).
     ///
     /// This pair is the only way clients enter or leave the registry — the
     /// request path ([`get_cluster`](Self::get_cluster)) can only look them

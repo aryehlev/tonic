@@ -37,18 +37,14 @@
 //!
 //! Each level determines the subscriptions for the next. When the set of
 //! referenced clusters changes, the manager reconciles CDS/EDS watches:
-//! adding watches for new clusters immediately, and dropping watches
-//! (+ cache entries + per-cluster clients) for removed ones only after
-//! [`CLUSTER_REMOVAL_GRACE`], so in-flight requests drain and transient
-//! config flaps don't tear down warm clients.
+//! adding watches (and per-cluster clients) for new clusters before the
+//! config is published, and dropping watches (+ cache entries + clients)
+//! for removed ones after.
 
 use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::Duration;
-
-use tokio::time::Instant;
 
 use futures_core::Stream;
 use tokio_stream::{StreamExt, StreamMap};
@@ -113,27 +109,15 @@ impl XdsResourceManager {
 /// The two halves run at different points of a reconcile:
 /// [`add_clusters`](Self::add_clusters) before the new route config is
 /// published, so a request routed on the new config always finds its
-/// client; [`evict_clusters`](Self::evict_clusters) only once a removed
-/// cluster's [`CLUSTER_REMOVAL_GRACE`] elapses, so requests routed on the
-/// old config snapshot drain against a live client and a transient flap
-/// never tears down a warm client.
+/// client; [`evict_clusters`](Self::evict_clusters) after publication, so
+/// the window in which a request routed on the old config snapshot can
+/// name an already-evicted cluster is as small as possible.
 pub(crate) trait ActiveClusterSync: Send + Sync {
     /// Create clients for clusters in `active` that don't have one yet.
     fn add_clusters(&self, active: &HashSet<String>);
     /// Drop the clients of clusters outside `keep`.
     fn evict_clusters(&self, keep: &HashSet<String>);
 }
-
-/// How long a cluster removed from the route config keeps its client,
-/// watchers, and cached resources before teardown.
-///
-/// Two things ride on this delay: requests already routed on the previous
-/// config snapshot (the router picks up a published config asynchronously)
-/// still find a live client and drain instead of hard-failing, and a
-/// transient control-plane flap that drops and restores a cluster within
-/// the grace keeps the warm client — its established connections and
-/// endpoint set — instead of rebuilding from scratch.
-const CLUSTER_REMOVAL_GRACE: Duration = Duration::from_secs(5);
 
 /// Mutable state for the entire LDS -> RDS -> CDS -> EDS cascade.
 ///
@@ -150,13 +134,8 @@ struct CascadeState {
     /// Current EDS service name per cluster, to detect when the name changes.
     eds_names: HashMap<String, String>,
     /// Keeps per-cluster clients matching the route config; driven by
-    /// [`reconcile_and_publish`](Self::reconcile_and_publish) and
-    /// [`process_due_removals`](Self::process_due_removals).
+    /// [`reconcile_and_publish`](Self::reconcile_and_publish).
     cluster_sync: Arc<dyn ActiveClusterSync>,
-    /// Clusters that left the route config, with the deadline at which
-    /// their teardown becomes final. A cluster re-entering the config
-    /// before its deadline is removed from here with nothing torn down.
-    pending_removals: HashMap<String, Instant>,
 }
 
 impl CascadeState {
@@ -168,7 +147,6 @@ impl CascadeState {
             eds_watchers: StreamMap::new(),
             eds_names: HashMap::new(),
             cluster_sync,
-            pending_removals: HashMap::new(),
         }
     }
 
@@ -181,8 +159,6 @@ impl CascadeState {
         let mut lds_watcher = xds_client.watch::<ListenerResource>(&listener_name).await;
 
         loop {
-            let next_removal = self.pending_removals.values().min().copied();
-
             tokio::select! {
                 biased;
 
@@ -206,18 +182,6 @@ impl CascadeState {
                         continue;
                     };
                     self.handle_rds(event, &xds_client, &cache).await;
-                }
-
-                // A removed cluster's grace elapsed; tear it down — unless a
-                // config update re-added it first (the LDS/RDS arms above
-                // run first under `biased` and cancel the pending removal).
-                _ = async {
-                    match next_removal {
-                        Some(deadline) => tokio::time::sleep_until(deadline).await,
-                        None => std::future::pending().await,
-                    }
-                } => {
-                    self.process_due_removals(&cache);
                 }
 
                 Some((name, event)) = self.cds_watchers.next(),
@@ -355,10 +319,12 @@ impl CascadeState {
     /// 2. The config is published immediately after — before any watch
     ///    registration, whose sends into the ADS worker's bounded command
     ///    channel can stall and must not delay publication.
-    /// 3. Removed clusters only start a [`CLUSTER_REMOVAL_GRACE`] timer;
-    ///    teardown and client eviction happen in
-    ///    [`process_due_removals`](Self::process_due_removals), unless the
-    ///    cluster re-enters the config first.
+    /// 3. Removed clusters are torn down after publication — dropping their
+    ///    watchers and cache entries ends their discovery streams (failing
+    ///    still-queued requests with UNAVAILABLE) and their clients are
+    ///    evicted — so a request routed on the old snapshot only hits a
+    ///    missing client in the small window before the router picks up the
+    ///    published config.
     /// 4. CDS watches for added clusters are registered last.
     async fn reconcile_and_publish(
         &mut self,
@@ -369,60 +335,24 @@ impl CascadeState {
         let new_clusters = route_config.cluster_names();
         let old_clusters: HashSet<String> = self.cds_watchers.keys().cloned().collect();
 
-        // A cluster re-entering the config cancels its pending removal;
-        // its watchers, cache entries, and warm client were never torn down.
-        self.pending_removals
-            .retain(|name, _| !new_clusters.contains(name));
-
         self.cluster_sync.add_clusters(&new_clusters);
 
         cache.update_route_config(route_config);
 
-        let deadline = Instant::now() + CLUSTER_REMOVAL_GRACE;
         for name in old_clusters.difference(&new_clusters) {
-            // `or_insert`: repeated configs without the cluster must not
-            // keep pushing an existing deadline out.
-            self.pending_removals
-                .entry(name.clone())
-                .or_insert(deadline);
-        }
-
-        for name in new_clusters.difference(&old_clusters) {
-            let watcher = xds_client.watch::<ClusterResource>(name).await;
-            self.cds_watchers
-                .insert(name.clone(), WatcherStream(watcher));
-        }
-    }
-
-    /// Finalizes every pending removal whose grace period has elapsed:
-    /// drops its CDS/EDS watchers and cache entries — which ends the
-    /// cluster's discovery streams, failing still-queued requests with
-    /// UNAVAILABLE — and evicts its client from the registry.
-    fn process_due_removals(&mut self, cache: &Arc<XdsCache>) {
-        let now = Instant::now();
-        let due: Vec<String> = self
-            .pending_removals
-            .iter()
-            .filter(|(_, deadline)| **deadline <= now)
-            .map(|(name, _)| name.clone())
-            .collect();
-        if due.is_empty() {
-            return;
-        }
-
-        for name in &due {
-            self.pending_removals.remove(name);
             self.cds_watchers.remove(name);
             self.eds_watchers.remove(name);
             self.eds_names.remove(name);
             cache.remove_cluster(name);
             cache.remove_endpoints(name);
         }
+        self.cluster_sync.evict_clusters(&new_clusters);
 
-        // Keep clients for everything still watched: active clusters plus
-        // pending removals that are not yet due.
-        let keep: HashSet<String> = self.cds_watchers.keys().cloned().collect();
-        self.cluster_sync.evict_clusters(&keep);
+        for name in new_clusters.difference(&old_clusters) {
+            let watcher = xds_client.watch::<ClusterResource>(name).await;
+            self.cds_watchers
+                .insert(name.clone(), WatcherStream(watcher));
+        }
     }
 }
 
@@ -480,13 +410,6 @@ mod tests {
     /// about client eviction.
     fn test_state() -> CascadeState {
         CascadeState::new(Arc::new(NoopSync))
-    }
-
-    /// Advance paused test time past the removal grace and finalize due
-    /// removals, as the run loop's timer arm would.
-    async fn expire_removals(state: &mut CascadeState, cache: &Arc<XdsCache>) {
-        tokio::time::advance(CLUSTER_REMOVAL_GRACE + Duration::from_millis(1)).await;
-        state.process_due_removals(cache);
     }
 
     fn make_route_config(name: &str, clusters: &[&str]) -> Arc<RouteConfigResource> {
@@ -582,10 +505,8 @@ mod tests {
         assert_eq!(state.cds_watchers.keys().count(), 2);
     }
 
-    /// A removed cluster keeps its watchers through the grace period and is
-    /// only torn down once the grace elapses.
-    #[tokio::test(start_paused = true)]
-    async fn reconcile_removes_old_clusters_after_grace() {
+    #[tokio::test]
+    async fn reconcile_removes_old_clusters() {
         let cache = test_cache();
         let client = test_client();
         let mut state = test_state();
@@ -596,51 +517,17 @@ mod tests {
         let rc2 = make_route_config("rc", &["b", "c"]);
         state.reconcile_and_publish(rc2, &client, &cache).await;
 
-        // Within the grace, "a" is pending removal but still watched.
-        assert!(state.cds_watchers.contains_key("a"));
-        assert!(state.pending_removals.contains_key("a"));
-        assert_eq!(state.cds_watchers.keys().count(), 3);
-
-        expire_removals(&mut state, &cache).await;
-
         assert!(!state.cds_watchers.contains_key("a"));
         assert!(state.cds_watchers.contains_key("b"));
         assert!(state.cds_watchers.contains_key("c"));
         assert_eq!(state.cds_watchers.keys().count(), 2);
-        assert!(state.pending_removals.is_empty());
     }
 
-    /// A cluster that leaves and re-enters the config within the grace
-    /// keeps its watchers (and, via the sync, its warm client): the pending
-    /// removal is canceled and nothing is torn down.
-    #[tokio::test(start_paused = true)]
-    async fn readded_cluster_cancels_pending_removal() {
-        let cache = test_cache();
-        let client = test_client();
-        let mut state = test_state();
-
-        state
-            .reconcile_and_publish(make_route_config("rc", &["a"]), &client, &cache)
-            .await;
-        state
-            .reconcile_and_publish(make_route_config("rc", &[]), &client, &cache)
-            .await;
-        assert!(state.pending_removals.contains_key("a"));
-
-        state
-            .reconcile_and_publish(make_route_config("rc", &["a"]), &client, &cache)
-            .await;
-        assert!(state.pending_removals.is_empty());
-
-        expire_removals(&mut state, &cache).await;
-        assert!(state.cds_watchers.contains_key("a"));
-    }
-
-    /// `add_clusters` gets the full authoritative set on every reconcile
-    /// (before publication), while `evict_clusters` fires only when a
-    /// removal's grace elapses, with the set of clusters to keep.
-    #[tokio::test(start_paused = true)]
-    async fn reconcile_adds_eagerly_and_evicts_after_grace() {
+    /// Every reconcile hands the full authoritative cluster set to both
+    /// sync halves — not a diff — with `add_clusters` before publication
+    /// and `evict_clusters` after (see `reconcile_and_publish`).
+    #[tokio::test]
+    async fn reconcile_syncs_with_authoritative_set() {
         let cache = test_cache();
         let client = test_client();
         let sync = Arc::new(RecordingSync::default());
@@ -652,28 +539,23 @@ mod tests {
         state
             .reconcile_and_publish(make_route_config("rc", &["b"]), &client, &cache)
             .await;
-        // Fires even on a no-change config.
+        // Fires even on a no-change config, keeping the registry's recorded
+        // active set authoritative on every route update.
         state
             .reconcile_and_publish(make_route_config("rc", &["b"]), &client, &cache)
             .await;
 
-        assert_eq!(
-            *sync.adds.lock().unwrap(),
-            vec![
-                vec!["a".to_string(), "b".to_string()],
-                vec!["b".to_string()],
-                vec!["b".to_string()],
-            ]
-        );
-        // "a" is inside its grace period: no eviction yet.
-        assert!(sync.evicts.lock().unwrap().is_empty());
-
-        expire_removals(&mut state, &cache).await;
-        assert_eq!(*sync.evicts.lock().unwrap(), vec![vec!["b".to_string()]]);
+        let expected = vec![
+            vec!["a".to_string(), "b".to_string()],
+            vec!["b".to_string()],
+            vec!["b".to_string()],
+        ];
+        assert_eq!(*sync.adds.lock().unwrap(), expected);
+        assert_eq!(*sync.evicts.lock().unwrap(), expected);
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn reconcile_to_empty_removes_all_after_grace() {
+    #[tokio::test]
+    async fn reconcile_to_empty_removes_all() {
         let cache = test_cache();
         let client = test_client();
         let mut state = test_state();
@@ -684,9 +566,6 @@ mod tests {
 
         let rc2 = make_route_config("rc", &[]);
         state.reconcile_and_publish(rc2, &client, &cache).await;
-        assert_eq!(state.cds_watchers.keys().count(), 1);
-
-        expire_removals(&mut state, &cache).await;
         assert_eq!(state.cds_watchers.keys().count(), 0);
     }
 
